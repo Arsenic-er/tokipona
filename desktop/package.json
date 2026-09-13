@@ -1,0 +1,9 @@
+{
+  "name": "tokipona-rpg",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Toki Pona RPG - local forest playtest",
+  "author": "tokipona-rpg contributors",
+  "main": "main.cjs"
+}

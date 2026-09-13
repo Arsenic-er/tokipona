@@ -1,6 +1,7 @@
 import { defineConfig } from "@playwright/test";
 
 export default defineConfig({
+  globalSetup: "./scripts/testing/forest-playwright-setup.cjs",
   testDir: "./e2e",
   fullyParallel: false,
   workers: 1,

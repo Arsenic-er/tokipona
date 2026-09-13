@@ -25,7 +25,16 @@ function createPlacer(
 ): (desired: Vec2) => Vec2 {
   const cache = new Map<string, Vec2>();
   let lastValid: Vec2 | null = null;
+  let terrainRevision = terrain.solidRevision;
   return (desired: Vec2): Vec2 => {
+    if (terrainRevision !== terrain.solidRevision) {
+      cache.clear();
+      terrainRevision = terrain.solidRevision;
+      if (lastValid && (terrain.isSolid({ x: lastValid.x - body.width / 2, y: lastValid.y - body.height, ...body }) ||
+        requireSupport && !terrain.isSolid({ x: lastValid.x - body.width / 2 + 1, y: lastValid.y, width: body.width - 2, height: 1 }))) {
+        lastValid = null;
+      }
+    }
     const key = `${Math.round(desired.x)},${Math.round(desired.y)}`;
     const cached = cache.get(key);
     if (cached !== undefined) {
@@ -83,10 +92,12 @@ function findNearbyAnchor(
           : [preferredY - verticalDistance, preferredY + verticalDistance]) {
           if (y < minimumY || y > maximumY) continue;
           const bodyBounds = { x: x - body.width / 2, y: y - body.height, ...body };
-          if (terrain.isSolid(bodyBounds)) continue;
           if (requireSupport && !terrain.isSolid({ x: x - body.width / 2 + 1, y, width: body.width - 2, height: 1 })) {
             continue;
           }
+          // Most candidates above the opened forest surface have no support.
+          // Reject those before scanning the full animal body through empty air.
+          if (terrain.isSolid(bodyBounds)) continue;
           return Object.freeze({ x, y });
         }
       }

@@ -5,6 +5,7 @@ import type {
 } from "../content/runtime-forest-opening-manifest";
 import { isVerifiedRuntimeForestOpeningManifest } from "../content/runtime-forest-opening-manifest";
 import { intersects, type Aabb } from "../runtime/geometry";
+import { ForestOpeningCreek, forestCreekToolBounds, type ForestCreekSave } from './forest-opening-creek';
 
 export const FOREST_OPENING_MATERIAL = Object.freeze({
   air: 0,
@@ -48,6 +49,8 @@ export interface ForestOpeningObstacleSave {
   readonly materialTick: number;
   readonly materialCells: readonly number[];
   readonly operationReceipts: readonly ForestOpeningObstacleOperationReceipt[];
+  readonly creek?: ForestCreekSave;
+  readonly routeProof?: Readonly<{tick:number; actorBounds:Aabb; solutionId:ForestOpeningSolutionId}> | null;
 }
 
 export interface ForestOpeningMaterialPocketSnapshot {
@@ -56,6 +59,9 @@ export interface ForestOpeningMaterialPocketSnapshot {
   readonly tick: number;
   readonly cells: readonly number[];
   readonly stateDigest: `sha256:${string}`;
+  readonly sharedTerrain?: true;
+  readonly integrated?: true;
+  readonly soilOpened?: boolean;
 }
 
 export interface ForestOpeningObstacleSnapshot {
@@ -84,6 +90,7 @@ const INTERACTION_RADIUS_PX = 48;
 const MATERIALS = new Set<number>(Object.values(FOREST_OPENING_MATERIAL));
 
 export class ForestOpeningObstacle {
+  readonly creek: ForestOpeningCreek | null;
   private readonly manifest: RuntimeForestOpeningManifest;
   private revision: number;
   private committedSolutionId: ForestOpeningSolutionId | null;
@@ -93,9 +100,12 @@ export class ForestOpeningObstacle {
   private materialTick: number;
   private materialCells: Uint8Array;
   private readonly operationReceipts = new Map<string, ForestOpeningObstacleOperationReceipt>();
+  private routeProof: ForestOpeningObstacleSave['routeProof'];
+  get integrated(): boolean { return this.creek?.integrated === true; }
 
   private constructor(manifest: RuntimeForestOpeningManifest, save: ForestOpeningObstacleSave) {
     this.manifest = manifest;
+    this.creek = save.creek ? new ForestOpeningCreek(manifest.obstacle.materialPocketPx, save.creek) : null;
     this.revision = save.revision;
     this.committedSolutionId = save.committedSolutionId;
     this.stones = freezeStones(save.stones);
@@ -103,13 +113,16 @@ export class ForestOpeningObstacle {
     this.shallowDetourEntered = save.shallowDetourEntered;
     this.materialTick = save.materialTick;
     this.materialCells = Uint8Array.from(save.materialCells);
+    this.routeProof=save.routeProof;
     for (const receipt of save.operationReceipts) this.operationReceipts.set(receipt.operationId, Object.freeze({ ...receipt }));
+    this.syncBodies();
   }
 
-  public static fresh(manifest: RuntimeForestOpeningManifest): ForestOpeningObstacle {
+  public static fresh(manifest: RuntimeForestOpeningManifest, dynamicCreek: boolean | 'integrated' = false): ForestOpeningObstacle {
     assertManifest(manifest);
     const cells = initialMaterialCells();
     const anchors = manifest.obstacle.objectAnchorsPx;
+    const creek = dynamicCreek ? new ForestOpeningCreek(manifest.obstacle.materialPocketPx,undefined,dynamicCreek==='integrated') : null;
     return new ForestOpeningObstacle(manifest, {
       schema: "tokipona.forest-opening-obstacle.v0.1",
       revision: 0,
@@ -121,8 +134,10 @@ export class ForestOpeningObstacle {
       deadwood: { bounds: { x: anchors.deadwood[0], y: anchors.deadwood[1], width: 64, height: 8 }, bridged: false },
       shallowDetourEntered: false,
       materialTick: 0,
-      materialCells: [...cells],
+      materialCells: creek?.cells() ?? [...cells],
       operationReceipts: [],
+      ...(creek ? { creek: creek.save() } : {}),
+      ...(creek?.integrated ? { routeProof:null } : {}),
     });
   }
 
@@ -154,17 +169,19 @@ export class ForestOpeningObstacle {
       return failure("stale_revision", this.snapshot());
     }
     const activeSolution = this.activeSolution();
-    if (activeSolution !== null && requestedSolution(request) !== activeSolution) {
+    if (!this.integrated && activeSolution !== null && requestedSolution(request) !== activeSolution) {
       return failure("solution_conflict", this.snapshot());
     }
-    const target = targetBounds(request, this.stones, this.deadwood, this.manifest.obstacle.materialPocketPx);
+    const target = this.creek && request.kind === 'enter_shallow_detour'
+      ? forestCreekToolBounds(this.manifest.obstacle.materialPocketPx)
+      : targetBounds(request, this.stones, this.deadwood, this.manifest.obstacle.materialPocketPx);
     if (!isWithinRange(context.actorBounds, target, INTERACTION_RADIUS_PX)) {
       return failure("out_of_range", this.snapshot());
     }
-    const changed = this.applyKnownInteraction(request);
+    const changed = this.applyKnownInteraction(request, context.actorBounds);
     if (!changed) return failure("blocked", this.snapshot());
     this.revision += 1;
-    this.updateCommittedSolution();
+    if(!this.integrated) this.updateCommittedSolution();
     this.operationReceipts.set(operationId, Object.freeze({
       operationId,
       requestHash,
@@ -177,9 +194,33 @@ export class ForestOpeningObstacle {
     if (!Number.isSafeInteger(ticks) || ticks < 0) throw new Error("forest opening material ticks must be non-negative");
     const nextTick = this.materialTick + ticks;
     if (!Number.isSafeInteger(nextTick)) throw new Error("forest opening material tick overflow");
+    if (this.creek) {
+      for (let tick = this.materialTick + 1; tick <= nextTick; tick++) this.creek.advance(tick);
+      this.syncBodies();
+      this.materialCells = Uint8Array.from(this.creek.cells());
+    } else this.materialCells = materialCellsAtTick(nextTick);
     this.materialTick = nextTick;
-    this.materialCells = materialCellsAtTick(nextTick);
     return this.snapshot();
+  }
+
+  /** Fixed-step hot path: do not construct and hash a discarded snapshot. */
+  public stepTick(actor?:Aabb, grounded=false): void {
+    if (!Number.isSafeInteger(this.materialTick + 1)) throw new Error('forest opening material tick overflow');
+    this.materialTick++;
+    if (this.creek) {
+      this.creek.advance(this.materialTick,actor);
+      this.syncBodies();
+      if (this.materialTick % 2 === 0 || this.integrated) this.materialCells = Uint8Array.from(this.creek.cells());
+      if(this.integrated && actor && grounded && actor.x>=1960 && this.committedSolutionId===null) {
+        // Actual passage is the proof; objects may be combined and no invisible gate exists.
+        const solutionId = this.stones.a.seated && this.stones.b.seated ? 'stone_steps'
+          : this.deadwood.bridged ? 'deadwood_bridge' : 'shallow_detour';
+        this.committedSolutionId=solutionId;
+        if(solutionId==='shallow_detour') this.shallowDetourEntered=true;
+        this.routeProof=Object.freeze({tick:this.materialTick,actorBounds:freezeAabb(actor),solutionId});
+        this.revision++;
+      }
+    } else this.materialCells = materialCellsAtTick(this.materialTick);
   }
 
   public materialAt(x: number, y: number): ForestOpeningMaterial {
@@ -190,6 +231,7 @@ export class ForestOpeningObstacle {
   }
 
   public blocksTraversal(bounds: Aabb): boolean {
+    if(this.integrated) return false; // Shared terrain already includes every real rigid body.
     if (this.committedSolutionId === "stone_steps") {
       return (this.stones.a.seated && intersects(bounds, this.stones.a.bounds)) ||
         (this.stones.b.seated && intersects(bounds, this.stones.b.bounds));
@@ -214,7 +256,7 @@ export class ForestOpeningObstacle {
     if (!Number.isSafeInteger(materialTick) || materialTick < 0) {
       throw new Error("forest opening reset material tick is invalid");
     }
-    if (this.committedSolutionId !== null) return this.snapshot();
+    if (this.integrated || this.committedSolutionId !== null) return this.snapshot();
     const fresh = ForestOpeningObstacle.fresh(this.manifest);
     this.revision = fresh.revision;
     this.committedSolutionId = fresh.committedSolutionId;
@@ -222,17 +264,20 @@ export class ForestOpeningObstacle {
     this.deadwood = fresh.deadwood;
     this.shallowDetourEntered = fresh.shallowDetourEntered;
     this.materialTick = materialTick;
-    this.materialCells = materialCellsAtTick(materialTick);
+    this.materialCells = this.creek ? Uint8Array.from(this.creek.cells()) : materialCellsAtTick(materialTick);
     this.operationReceipts.clear();
     return this.snapshot();
   }
 
   public snapshot(): ForestOpeningObstacleSnapshot {
-    const cells = Object.freeze([...this.materialCells]);
-    const materialBody = { width: WIDTH, height: HEIGHT, tick: this.materialTick, cells } as const;
+    const cells = this.creek?.cells() ?? Object.freeze([...this.materialCells]);
+    const materialBody = { width: WIDTH, height: HEIGHT, tick: this.materialTick, cells,
+      ...(this.creek ? { sharedTerrain: true as const } : {}) } as const;
+    const integratedBody = this.integrated ? {...materialBody,integrated:true as const,soilOpened:this.creek!.opened} : materialBody;
+    let materialDigest: `sha256:${string}` | undefined;
     const materialPocket = Object.freeze({
-      ...materialBody,
-      stateDigest: sha256Canonical(materialBody as unknown as JsonValue),
+      ...integratedBody,
+      get stateDigest() { return materialDigest ??= sha256Canonical(integratedBody as unknown as JsonValue); },
     });
     const body = {
       revision: this.revision,
@@ -242,13 +287,20 @@ export class ForestOpeningObstacle {
       shallowDetourEntered: this.shallowDetourEntered,
       materialPocket,
     };
+    let digest: `sha256:${string}` | undefined;
     return Object.freeze({
       ...body,
-      stateDigest: sha256Canonical({
+      get stateDigest() { return digest ??= sha256Canonical({
         ...body,
         materialPocket: materialPocket.stateDigest,
-      } as unknown as JsonValue),
+      } as unknown as JsonValue); },
     });
+  }
+
+  public rejectPendingCrossing(): void {
+    if(!this.integrated || !this.routeProof) return;
+    this.routeProof=null; this.committedSolutionId=null; this.shallowDetourEntered=false;
+    this.revision--;
   }
 
   public save(): ForestOpeningObstacleSave {
@@ -262,10 +314,19 @@ export class ForestOpeningObstacle {
       materialTick: this.materialTick,
       materialCells: Object.freeze([...this.materialCells]),
       operationReceipts: Object.freeze([...this.operationReceipts.values()].map((receipt) => Object.freeze({ ...receipt }))),
+      ...(this.creek ? { creek: this.creek.save() } : {}),
+      ...(this.integrated ? {routeProof:this.routeProof ?? null} : {}),
     });
   }
 
-  private applyKnownInteraction(request: ForestOpeningInteraction): boolean {
+  private applyKnownInteraction(request: ForestOpeningInteraction, actor?: Aabb): boolean {
+    if(this.integrated) {
+      if(request.kind==='enter_shallow_detour') {
+        if(!this.creek!.dig(actor)) return false;
+        this.materialCells=Uint8Array.from(this.creek!.cells());
+      } else if(!this.creek!.push(request.objectId,request.direction)) return false;
+      this.syncBodies(); return true;
+    }
     if (request.kind === "push_stone") {
       if (request.direction !== 1) return false;
       if (request.objectId === "stream.stone.a") {
@@ -292,6 +353,10 @@ export class ForestOpeningObstacle {
       return true;
     }
     if (this.shallowDetourEntered) return false;
+    if (this.creek) {
+      this.creek.dig();
+      this.materialCells = Uint8Array.from(this.creek.cells());
+    }
     this.shallowDetourEntered = true;
     return true;
   }
@@ -301,6 +366,12 @@ export class ForestOpeningObstacle {
     if (this.stones.a.seated && this.stones.b.seated) this.committedSolutionId = "stone_steps";
     else if (this.deadwood.bridged) this.committedSolutionId = "deadwood_bridge";
     else if (this.shallowDetourEntered) this.committedSolutionId = "shallow_detour";
+  }
+
+  private syncBodies(): void {
+    if (!this.integrated) return;
+    const projected=physicalBodyProjection(this.creek!);
+    this.stones=projected.stones; this.deadwood=projected.deadwood;
   }
 
   private activeSolution(): ForestOpeningSolutionId | null {
@@ -451,10 +522,36 @@ function assertManifest(manifest: RuntimeForestOpeningManifest): void {
   if (!isVerifiedRuntimeForestOpeningManifest(manifest)) throw new Error("forest opening obstacle requires a verified manifest");
 }
 
+function physicalBodyProjection(creek:ForestOpeningCreek) {
+  const [a,b,wood]=creek.bodyStates;
+  const stone=(body:typeof a)=>({bounds:freezeAabb(body!),seated:body!.touched && body!.restTicks>=12 && body!.x>=1826});
+  return {stones:freezeStones({a:stone(a),b:stone(b)}),
+    deadwood:freezeDeadwood({bounds:freezeAabb(wood!),bridged:wood!.touched && wood!.x<1906 && wood!.x+wood!.width>1840 &&
+      (wood!.restTicks>=12 || creek.wetFraction(wood!)>0.2 && Math.abs(wood!.vy)<8)})};
+}
+
 function validateSavedPhysicalState(
   manifest: RuntimeForestOpeningManifest,
   save: ForestOpeningObstacleSave,
 ): void {
+  if(save.creek?.schema==='tokipona.forest-creek.v0.2') {
+    const creek=new ForestOpeningCreek(manifest.obstacle.materialPocketPx,save.creek);
+    const [a,b,wood]=creek.bodyStates;
+    const projected=physicalBodyProjection(creek);
+    if(save.stones.a.seated!==projected.stones.a.seated || save.stones.b.seated!==projected.stones.b.seated ||
+      save.deadwood.bridged!==projected.deadwood.bridged) throw new Error('integrated body result projection invalid');
+    if(!sameAabb(save.stones.a.bounds,a!) || !sameAabb(save.stones.b.bounds,b!) || !sameAabb(save.deadwood.bounds,wood!) ||
+      save.creek.grid.tick!==Math.floor(save.materialTick/2) || save.materialCells.some((m,i)=>m!==creek.cells()[i]))
+      throw new Error('integrated forest physical projection invalid');
+    const proof=save.routeProof;
+    if(proof===undefined || (proof===null)!==(save.committedSolutionId===null) || proof &&
+      (proof.solutionId!==save.committedSolutionId || !safeNonNegative(proof.tick) || proof.tick>save.materialTick ||
+        proof.actorBounds.width!==12 || proof.actorBounds.height!==14 || proof.actorBounds.x<1960 || proof.actorBounds.x>2060 ||
+        proof.actorBounds.y<620 || proof.actorBounds.y>786)) throw new Error('forest crossing proof invalid');
+    if(save.shallowDetourEntered!==(save.committedSolutionId==='shallow_detour')) throw new Error('forest bypass proof invalid');
+    return;
+  }
+  if(save.routeProof!==undefined) throw new Error('legacy forest cannot contain new physics proof');
   const anchors = manifest.obstacle.objectAnchorsPx;
   const expectedStoneA = save.stones.a.seated
     ? { x: 1872, y: 736, width: 12, height: 12 }
@@ -483,7 +580,12 @@ function validateSavedPhysicalState(
   if (!canonical) {
     throw new Error("forest opening saved solution does not match physical state");
   }
-  const expectedMaterials = materialCellsAtTick(save.materialTick);
+  const creek = save.creek ? new ForestOpeningCreek(manifest.obstacle.materialPocketPx, save.creek) : null;
+  if (creek && (creek.opened !== save.shallowDetourEntered || save.creek!.grid.tick !== Math.floor(save.materialTick / 2))) {
+    throw new Error('forest opening creek timeline or tool state invalid');
+  }
+
+  const expectedMaterials = creek?.cells() ?? materialCellsAtTick(save.materialTick);
   if (save.materialCells.some((material, index) => material !== expectedMaterials[index])) {
     throw new Error("forest opening saved material state is invalid for its tick");
   }
@@ -496,7 +598,8 @@ function sameAabb(left: Aabb, right: Aabb): boolean {
 
 function readObstacleSave(candidate: unknown): ForestOpeningObstacleSave {
   const raw = record(candidate, "forest opening obstacle save");
-  exactKeys(raw, ["schema", "revision", "committedSolutionId", "stones", "deadwood", "shallowDetourEntered", "materialTick", "materialCells", "operationReceipts"], "forest opening obstacle save");
+  exactKeys(raw, ["schema", "revision", "committedSolutionId", "stones", "deadwood", "shallowDetourEntered", "materialTick", "materialCells", "operationReceipts",
+    ...('creek' in raw ? ['creek'] : []),...('routeProof' in raw ? ['routeProof'] : [])], "forest opening obstacle save");
   if (raw.schema !== "tokipona.forest-opening-obstacle.v0.1" || !safeNonNegative(raw.revision) ||
       !safeNonNegative(raw.materialTick) || typeof raw.shallowDetourEntered !== "boolean") {
     throw new Error("forest opening obstacle save is invalid");
@@ -505,6 +608,13 @@ function readObstacleSave(candidate: unknown): ForestOpeningObstacleSave {
     throw new Error("forest opening obstacle solution is invalid");
   }
   const stonesRaw = record(raw.stones, "forest opening stones");
+  if ('creek' in raw) record(raw.creek, 'forest opening creek');
+  let routeProof:ForestOpeningObstacleSave['routeProof'];
+  if('routeProof' in raw) {
+    if(raw.routeProof===null) routeProof=null;
+    else { const proof=record(raw.routeProof,'crossing proof'); exactKeys(proof,['tick','actorBounds','solutionId'],'crossing proof');
+      routeProof=Object.freeze({tick:proof.tick as number,actorBounds:readAabb(proof.actorBounds,'crossing actor'),solutionId:proof.solutionId as ForestOpeningSolutionId}); }
+  }
   exactKeys(stonesRaw, ["a", "b"], "forest opening stones");
   const stones = {
     a: readStone(stonesRaw.a, "stone A"),
@@ -539,6 +649,8 @@ function readObstacleSave(candidate: unknown): ForestOpeningObstacleSave {
     materialTick: raw.materialTick as number,
     materialCells: Object.freeze([...raw.materialCells] as number[]),
     operationReceipts: Object.freeze(receipts),
+    ...('creek' in raw ? { creek: raw.creek as ForestCreekSave } : {}),
+    ...('routeProof' in raw ? {routeProof} : {}),
   });
 }
 

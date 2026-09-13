@@ -81,7 +81,6 @@ export function advanceForestCamera(
     FOREST_CAMERA_TUNING.horizontalDamping,
     FOREST_CAMERA_TUNING.maxHorizontalSpeed,
     fixedSeconds,
-    contract.pixelSnap,
   );
   const y = smoothAxis(
     previous.y,
@@ -89,11 +88,12 @@ export function advanceForestCamera(
     FOREST_CAMERA_TUNING.verticalDamping,
     FOREST_CAMERA_TUNING.maxVerticalSpeed,
     fixedSeconds,
-    contract.pixelSnap,
   );
   return Object.freeze({
-    x: snapAndClamp(x, 0, regionBounds.width - width, contract.pixelSnap),
-    y: snapAndClamp(y, 0, regionBounds.height - height, contract.pixelSnap),
+    // Keep subpixel pursuit in simulation. Quantize the composed render view,
+    // not this accumulator, otherwise slow tracking advances in one-pixel kicks.
+    x: clamp(x, 0, regionBounds.width - width),
+    y: clamp(y, 0, regionBounds.height - height),
     width,
     height,
     facing,
@@ -127,17 +127,10 @@ function smoothAxis(
   damping: number,
   maximumSpeed: number,
   fixedSeconds: number,
-  pixelSnap: boolean,
 ): number {
   const delta = target - previous;
-  if (Math.abs(delta) < 1e-9) return previous;
+  if (Math.abs(delta) < 1e-9) return target;
   const dampingStep = Math.abs(delta) * (1 - Math.exp(-damping * fixedSeconds));
-  const maximumStep = Math.max(pixelSnap ? 1 : 0, maximumSpeed * fixedSeconds);
-  const step = Math.sign(delta) * Math.min(Math.abs(delta), Math.max(pixelSnap ? 1 : 0, dampingStep), maximumStep);
-  return pixelSnap ? Math.round(previous + step) : previous + step;
-}
-
-function snapAndClamp(value: number, minimum: number, maximum: number, pixelSnap: boolean): number {
-  const clamped = clamp(value, minimum, maximum);
-  return pixelSnap ? Math.round(clamped) : clamped;
+  const step = Math.sign(delta) * Math.min(Math.abs(delta), dampingStep, maximumSpeed * fixedSeconds);
+  return previous + step;
 }

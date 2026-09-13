@@ -17,6 +17,7 @@ function fresh(suffix = "default"): PrologueForestOpeningSession {
     seed: `forest.opening.${suffix}.seed`,
     currentMp: 13,
     maxMp: 24,
+    physics: 'shared', // Legacy v0.1 route/transaction compatibility suite; v0.2 is tested separately.
   });
 }
 
@@ -114,7 +115,8 @@ describe("PrologueForestOpeningSession", () => {
       return positioned;
     }],
     ["shallow_detour", (target: PrologueForestOpeningSession) => {
-      const positioned = atPosition(target, 1_792, 704);
+      // The ordinary tool must reach the actual soil plug, not any point on the old water rectangle.
+      const positioned = atPosition(target, 1_860, 714);
       expect(positioned.interact("detour", {
         kind: "enter_shallow_detour",
       }, 0)).toMatchObject({ accepted: true, reason: "committed" });

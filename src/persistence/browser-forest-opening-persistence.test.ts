@@ -42,10 +42,11 @@ class MemoryVisibilityTarget implements VisibilityTarget {
   public hide(): void { this.visibilityState = "hidden"; for (const listener of this.listeners) listener(); }
 }
 
-function fresh(suffix = "default"): PrologueForestOpeningSession {
+function fresh(suffix = "default", physics:'shared'|'integrated'='integrated'): PrologueForestOpeningSession {
   return PrologueForestOpeningSession.fresh({
     sessionId: `browser.forest.${suffix}`,
     seed: `browser.forest.${suffix}.seed`,
+    physics,
   });
 }
 
@@ -110,7 +111,7 @@ describe("BrowserForestOpeningPersistence", () => {
     }))).toThrow(/checksum|timeline|save/i);
     expect(() => readBrowserForestOpeningSave(resign({ ...clean, savedAtTick: 999 }))).toThrow(/tick|stale/i);
 
-    const positioned = fresh("solved");
+    const positioned = fresh("solved", "shared");
     for (let batch = 0; batch < 300 && positioned.snapshot().runtime.spatial.player.position.x < 1_832; batch += 1) {
       positioned.advanceTicks(10, { moveX: 1, jump: batch > 0 && batch % 12 === 0 });
     }
@@ -179,5 +180,28 @@ describe("BrowserForestOpeningPersistence", () => {
     expect(persistence.reset()).toBe(backup);
     expect(storage.getItem("forest.opening")).toBeNull();
     expect(persistence.reset()).toBeNull();
+  });
+
+  it("reports failed lifecycle saves, preserves old bytes, and recovers on the next flush", () => {
+    const storage = new MemoryStorage();
+    const persistence = new BrowserForestOpeningPersistence(storage, "forest.opening");
+    const target = fresh("retry");
+    persistence.save(target);
+    const original = storage.getItem("forest.opening");
+    const page = new MemoryPageHideTarget();
+    const outcomes: boolean[] = [];
+    const dispose = persistence.bindLifecycle(page, new MemoryVisibilityTarget(), () => target,
+      saved => outcomes.push(saved));
+    const write = storage.setItem.bind(storage);
+    storage.setItem = () => { throw new Error("quota exceeded"); };
+    target.advanceTicks(2);
+    expect(() => page.hide()).not.toThrow();
+    expect(storage.getItem("forest.opening")).toBe(original);
+    expect(outcomes).toEqual([false]);
+    storage.setItem = write;
+    page.hide();
+    expect(outcomes).toEqual([false, true]);
+    expect(persistence.load()).toMatchObject({ ok: true, save: { savedAtTick: 2 } });
+    dispose();
   });
 });

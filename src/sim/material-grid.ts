@@ -1,4 +1,5 @@
 import { MATERIALS, Material, isPlayerSolid } from "./materials";
+import { readMaterialGridSave, validateMaterialGridShape, type MaterialGridSave } from "./material-grid-save";
 
 const ROOM_TEMPERATURE = 200;
 const MIN_TEMPERATURE = -1800;
@@ -35,8 +36,32 @@ export class MaterialGrid {
   private tickId = 0;
   private thermalTick = 0;
   private readonly seed: number;
+  private occupancy: Uint8Array | null = null;
+  private powderExclusion: Uint8Array | null = null;
+
+  /** Actors exclude incoming solid grains, while water can still immerse them. */
+  setPowderExclusion(mask: Uint8Array | null): void {
+    if(mask && mask.length!==this.material.length) throw new Error('powder exclusion size invalid');
+    this.powderExclusion=mask;
+  }
+
+  /** Transient rigid-body occupancy; the world persists bodies, not a second material copy. */
+  setOccupancy(mask: Uint8Array | null): void {
+    if (mask && mask.length !== this.material.length) throw new Error('material occupancy size invalid');
+    this.occupancy = mask;
+  }
+
+  /** Conservative relocation for swept rigid bodies: carry the entire cell state. */
+  relocateCell(from: number, to: number): void {
+    if (![from, to].every(i => Number.isInteger(i) && i >= 0 && i < this.material.length) ||
+      this.material[to] !== Material.Air) throw new Error('material relocation invalid');
+    this.swapCellState(from, to);
+    const marker = this.movedAt[from]; this.movedAt[from] = this.movedAt[to]; this.movedAt[to] = marker;
+  }
 
   constructor(width: number, height: number, seed = 0x746f6b69) {
+    validateMaterialGridShape(width, height);
+    if (!Number.isInteger(seed) || seed < -2_147_483_648 || seed > 4_294_967_295) throw new Error("material_grid_seed_invalid");
     this.width = width;
     this.height = height;
     const size = width * height;
@@ -49,6 +74,27 @@ export class MaterialGrid {
     this.movedAt = new Uint32Array(size);
     this.seed = seed;
     this.clear();
+  }
+
+  /** Snapshot at a completed tick boundary; detached arrays cannot mutate the live grid. */
+  save(): MaterialGridSave {
+    const cells = (array: ArrayLike<number>) => Object.freeze(Array.from(array));
+    return Object.freeze({ schema: "tokipona.material-grid.v0.1", width: this.width, height: this.height,
+      seed: this.seed, tick: this.tickId, thermalTick: this.thermalTick,
+      material: cells(this.material), temperature: cells(this.temperature), integrity: cells(this.integrity),
+      phaseProgress: cells(this.phaseProgress), burning: cells(this.burning), lift: cells(this.lift), movedAt: cells(this.movedAt) });
+  }
+
+  static fromSave(candidate: unknown): MaterialGrid {
+    // Validate every field before allocating or publishing a replacement grid.
+    const state = readMaterialGridSave(candidate);
+    const grid = new MaterialGrid(state.width, state.height, state.seed);
+    grid.tickId = state.tick;
+    grid.thermalTick = state.thermalTick;
+    for (const key of ['material', 'temperature', 'integrity', 'phaseProgress', 'burning', 'lift', 'movedAt'] as const) {
+      grid[key].set(state[key]);
+    }
+    return grid;
   }
 
   clear(material = Material.Air): void {
@@ -167,6 +213,8 @@ export class MaterialGrid {
   }
 
   tick(): void {
+    // movedAt is Uint32; preserve the once-per-step guard when its counter wraps.
+    if (this.tickId === 4_294_967_295) { this.tickId = 0; this.movedAt.fill(0); }
     this.tickId += 1;
     this.updateForces();
     this.updateSteam();
@@ -325,9 +373,11 @@ export class MaterialGrid {
     if (!this.inBounds(toX, toY)) return false;
     const from = this.index(fromX, fromY);
     const to = this.index(toX, toY);
+    if (this.occupancy?.[to] || this.occupancy?.[from]) return false;
     if (this.movedAt[from] === this.tickId || this.movedAt[to] === this.tickId) return false;
 
     const source = this.material[from] as Material;
+    if(source===Material.Sand && this.powderExclusion?.[to]) return false;
     const target = this.material[to] as Material;
     const sourceDefinition = MATERIALS[source];
     const targetDefinition = MATERIALS[target];

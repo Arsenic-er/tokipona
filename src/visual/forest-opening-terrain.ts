@@ -1,35 +1,29 @@
 import type { ForestCameraState } from "../runtime/forest-camera";
 import { FOREST_MATERIAL, type ForestMaterialChunk } from "../world/forest-chunk-stream";
+import { drawForestGroundCover } from "./forest-ground-cover";
+import { forestMaterialColor } from "./forest-material-texture";
+export { drawForestOpeningBackdrop } from "./forest-opening-backdrop";
+export { renderForestOpeningView } from "./forest-opening-renderer";
+export { ForestOpeningJourney } from "./forest-opening-journey";
+export { ForestMouseCamera, bindForestMouseCamera } from "./forest-mouse-camera";
 
-const WIDTH = 640;
-const HEIGHT = 360;
 const surfaces = new WeakMap<object, {
   canvas: HTMLCanvasElement;
   context: CanvasRenderingContext2D;
-  image: ImageData | null;
+  tiles: Map<string, ImageData>;
+  drawn: Map<string, string>;
   chunks: readonly ForestMaterialChunk[] | null;
   originX: number;
   originY: number;
 }>();
-const COLORS: Readonly<Record<number, readonly [number, number, number, number]>> = Object.freeze({
-  [FOREST_MATERIAL.air]: [0, 0, 0, 0],
-  [FOREST_MATERIAL.protected_mass]: [25, 31, 29, 255],
-  [FOREST_MATERIAL.soil]: [63, 61, 40, 255],
-  [FOREST_MATERIAL.wet_soil]: [38, 52, 47, 255],
-  [FOREST_MATERIAL.stone]: [31, 39, 37, 255],
-  [FOREST_MATERIAL.wood]: [70, 55, 36, 255],
-  [FOREST_MATERIAL.metal]: [80, 87, 77, 255],
-  [FOREST_MATERIAL.water]: [35, 82, 88, 214],
-  [FOREST_MATERIAL.vegetation]: [73, 91, 61, 255],
-});
 
 export function rasterizeForestOpeningTerrain(
   chunks: readonly ForestMaterialChunk[],
   camera: ForestCameraState,
-  target = new Uint8ClampedArray(WIDTH * HEIGHT * 4),
+  target = new Uint8ClampedArray(camera.width * camera.height * 4),
 ): Uint8ClampedArray {
-  if (target.length !== WIDTH * HEIGHT * 4) throw new Error("forest opening terrain buffer must be exact 640x360 RGBA");
-  rasterize(chunks, camera.x, camera.y, WIDTH, HEIGHT, target);
+  if (target.length !== camera.width * camera.height * 4) throw new Error("forest opening terrain buffer must match the camera RGBA dimensions");
+  rasterize(chunks, Math.round(camera.x), Math.round(camera.y), camera.width, camera.height, target);
   return target;
 }
 
@@ -42,6 +36,17 @@ function rasterize(
   target: Uint8ClampedArray,
 ): void {
   target.fill(0);
+  const halo = 4;
+  const maskWidth = width + halo * 2;
+  // Unloaded neighbors must not masquerade as exposed air at a tile seam.
+  const mask = new Uint8Array(maskWidth * (height + halo * 2)).fill(255);
+  for (const chunk of chunks) {
+    for (let ly = 0; ly < 16; ly += 1) for (let lx = 0; lx < 16; lx += 1) {
+      const x = chunk.chunkX * 16 + lx - cameraX + halo;
+      const y = chunk.chunkY * 16 + ly - cameraY + halo;
+      if (x >= 0 && x < maskWidth && y >= 0 && y < height + halo * 2) mask[y * maskWidth + x] = chunk.materials[ly * 16 + lx]!;
+    }
+  }
   for (const chunk of chunks) {
     const originX = chunk.chunkX * 16 - cameraX;
     const originY = chunk.chunkY * 16 - cameraY;
@@ -51,13 +56,27 @@ function rasterize(
       for (let localX = 0; localX < 16; localX += 1) {
         const x = originX + localX;
         if (!Number.isInteger(x) || x < 0 || x >= width) continue;
-        const color = COLORS[chunk.materials[localY * 16 + localX]!];
-        if (!color || color[3] === 0) continue;
+        const material = chunk.materials[localY * 16 + localX]!;
+        if (material === FOREST_MATERIAL.air) continue;
         const offset = (y * width + x) * 4;
+        const worldX = chunk.chunkX * 16 + localX;
+        const worldY = chunk.chunkY * 16 + localY;
+        const center = (y + halo) * maskWidth + x + halo;
+        let top = 0;
+        for (let d = 1; d <= halo; d++) {
+          const above = mask[center - d * maskWidth]!;
+          if (above === FOREST_MATERIAL.air) { top = d; break; }
+          if (above !== material) break;
+        }
+        const color = forestMaterialColor(material, worldX, worldY, {
+          top,
+          side: mask[center - 1] === FOREST_MATERIAL.air || mask[center + 1] === FOREST_MATERIAL.air,
+          bottom: mask[center + maskWidth] === FOREST_MATERIAL.air,
+        });
         target[offset] = color[0];
         target[offset + 1] = color[1];
         target[offset + 2] = color[2];
-        target[offset + 3] = color[3];
+        target[offset + 3] = material === FOREST_MATERIAL.water ? 214 : 255;
       }
     }
   }
@@ -74,7 +93,7 @@ export function drawForestOpeningTerrain(
     const canvas = context.canvas.ownerDocument.createElement("canvas");
     const target = canvas.getContext("2d", { alpha: true });
     if (!target) throw new Error("forest opening terrain surface is unavailable");
-    surface = { canvas, context: target, image: null, chunks: null, originX: 0, originY: 0 };
+    surface = { canvas, context: target, tiles: new Map(), drawn: new Map(), chunks: null, originX: 0, originY: 0 };
     surfaces.set(context, surface);
   }
   if (surface.chunks !== chunks) {
@@ -90,24 +109,57 @@ export function drawForestOpeningTerrain(
     }
     const width = (right - left + 1) * 16;
     const height = (bottom - top + 1) * 16;
-    surface.canvas.width = width;
-    surface.canvas.height = height;
-    surface.image = surface.context.createImageData(width, height);
+    // Water can change each material tick. Keep the backing canvas and upload
+    // only dirty tiles; resizing it would clear and upload every static tile.
+    if (surface.canvas.width !== width || surface.canvas.height !== height ||
+        surface.originX !== left * 16 || surface.originY !== top * 16) {
+      surface.canvas.width = width;
+      surface.canvas.height = height;
+      surface.drawn.clear();
+    }
     surface.originX = left * 16;
     surface.originY = top * 16;
     surface.chunks = chunks;
-    rasterize(chunks, surface.originX, surface.originY, width, height, surface.image.data);
-    surface.context.putImageData(surface.image, 0, 0);
+    const byLocation = new Map(chunks.map((chunk) => [`${chunk.chunkX},${chunk.chunkY}`, chunk]));
+    for (const chunk of chunks) {
+      // Every sampled edge must be part of the cache key: otherwise excavation
+      // or moving water could leave stale highlights at chunk boundaries.
+      const neighborhood: ForestMaterialChunk[] = [];
+      const digests: string[] = [];
+      for (const [dx, dy] of [[0, 0], [0, -1], [-1, 0], [1, 0], [0, 1]] as const) {
+        const neighbor = byLocation.get(`${chunk.chunkX + dx},${chunk.chunkY + dy}`);
+        if (neighbor) neighborhood.push(neighbor);
+        digests.push(neighbor?.digest ?? "missing");
+      }
+      const key = `${chunk.chunkX},${chunk.chunkY}:${digests.join(":")}`;
+      const location = `${chunk.chunkX},${chunk.chunkY}`;
+      if (surface.drawn.get(location) === key) continue;
+      let tile = surface.tiles.get(key);
+      if (!tile) {
+        tile = surface.context.createImageData(16, 16);
+        rasterize(neighborhood, chunk.chunkX * 16, chunk.chunkY * 16, 16, 16, tile.data);
+        surface.tiles.set(key, tile);
+      }
+      surface.context.putImageData(tile, (chunk.chunkX - left) * 16, (chunk.chunkY - top) * 16);
+      surface.drawn.set(location, key);
+    }
+    for (const location of surface.drawn.keys()) if (!byLocation.has(location)) {
+      const [x,y] = location.split(',').map(Number);
+      surface.context.clearRect(x! * 16 - surface.originX, y! * 16 - surface.originY, 16, 16);
+      surface.drawn.delete(location);
+    }
+    while (surface.tiles.size > 2048) surface.tiles.delete(surface.tiles.keys().next().value!);
   }
   context.drawImage(
     surface.canvas,
-    camera.x - surface.originX,
-    camera.y - surface.originY,
-    WIDTH,
-    HEIGHT,
+    Math.round(camera.x) - surface.originX,
+    Math.round(camera.y) - surface.originY,
+    camera.width,
+    camera.height,
     0,
     0,
-    WIDTH,
-    HEIGHT,
+    camera.width,
+    camera.height,
   );
+  drawForestGroundCover(context, chunks, camera);
 }

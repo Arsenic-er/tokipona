@@ -20,3 +20,13 @@ if (actualSha256 !== expectedSha256) {
 mkdirSync(dirname(destination), { recursive: true });
 copyFileSync(source, destination);
 console.log("local_traveler_atlas_ready:v0.6");
+
+const forestSource = resolve(repositoryRoot,
+  "../tokipona-asset/exports/runtime/forest-chapter/waterwheel-benchmark/v0.3/background-far.v0.3.png");
+const forestBytes = readFileSync(forestSource);
+if (createHash("sha256").update(forestBytes).digest("hex") !==
+    "0998ab9342060b8bfabbd16aa5d23543dc664bf6957aa0aa0257ae59e7911609") {
+  throw new Error("local forest backdrop digest does not match the existing v0.3 candidate");
+}
+copyFileSync(forestSource, resolve(repositoryRoot, "src/local-art-cache/background-far.v0.3.png"));
+console.log("local_forest_backdrop_ready:v0.3");

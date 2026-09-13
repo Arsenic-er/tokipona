@@ -28,6 +28,17 @@ function camera(x: number, y: number, facing: "left" | "right" = "right"): Fores
 }
 
 describe("continuous forest camera", () => {
+  it("accumulates subpixel pursuit without imposing a one-pixel minimum step", () => {
+    const previous = camera(1000, 1000);
+    const target = player(1276, 1173, 2);
+    const first = advanceForestCamera(contract, previous, target, bounds);
+    expect(first.x).toBeGreaterThan(previous.x);
+    expect(first.x - previous.x).toBeLessThan(1);
+    expect(Number.isInteger(first.x)).toBe(false);
+    const second = advanceForestCamera(contract, first, target, bounds);
+    expect(second.x).toBeGreaterThan(first.x);
+    expect(second.x - first.x).toBeLessThan(first.x - previous.x);
+  });
   it("keeps the fixed 640 by 360 crop at every player position", () => {
     const positions = [player(0, 0), player(5_000, 1_440), player(10_228, 2_866)];
 
@@ -94,7 +105,7 @@ describe("continuous forest camera", () => {
     expect(result.y).toBeLessThan(1_100);
   });
 
-  it("pixel-snaps and clamps both axes to the authored 10240 by 2880 region", () => {
+  it("clamps both axes to the authored 10240 by 2880 region after settling", () => {
     let topLeft = camera(100, 100, "left");
     let bottomRight = camera(9_000, 2_000);
     for (let tick = 0; tick < 4_000; tick += 1) {

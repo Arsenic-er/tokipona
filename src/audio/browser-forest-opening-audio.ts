@@ -32,6 +32,8 @@ export interface ForestOpeningMovementAudioInput {
   readonly districtId: string;
   readonly solutionId: "stone_steps" | "deadwood_bridge" | "shallow_detour" | null;
   readonly position: Vec2;
+  /** New gait supplies physical contact; omitted only by legacy callers. */
+  readonly footContact?: boolean;
 }
 
 export interface ForestOpeningAudioPort {
@@ -66,7 +68,8 @@ export function projectForestOpeningMovementAudioEvents(
   input: ForestOpeningMovementAudioInput,
 ): readonly ForestOpeningAudioEvent[] {
   if (!Number.isSafeInteger(input.tick) || input.tick < 0 || !Number.isFinite(input.velocityX) ||
-      !input.grounded || Math.abs(input.velocityX) < 0.1 || input.tick % 12 !== 0) return Object.freeze([]);
+      !input.grounded || Math.abs(input.velocityX) < 0.1 ||
+      !(input.footContact ?? input.tick % 12 === 0)) return Object.freeze([]);
   const surface = input.districtId !== "forest.stream" ? "soil"
     : input.solutionId === "stone_steps" ? "stone"
       : input.solutionId === "deadwood_bridge" ? "deadwood"

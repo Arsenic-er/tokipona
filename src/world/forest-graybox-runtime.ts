@@ -10,6 +10,9 @@ import {
   normalizeMoveAxis,
   PLAYER_MOTION,
   stepPlayerMotion,
+  EMPTY_JUMP_GRACE,
+  PLAYER_JUMP_GRACE,
+  type PlayerJumpGrace,
   type PlayerMotionState,
 } from "../runtime/player-motion";
 import type {
@@ -49,6 +52,7 @@ export interface ForestGrayboxSave {
   readonly tick: number;
   readonly accumulatorSeconds: number;
   readonly previousJump: boolean;
+  readonly jumpGrace?: PlayerJumpGrace;
   readonly player: PlayerMotionState;
   readonly camera: ForestCameraState;
   readonly checkpoint: ForestGrayboxCheckpoint;
@@ -78,6 +82,8 @@ export class ForestGrayboxRuntime {
   private readonly meadowSurfaces: ForestRegion["meadowSurfaces"];
   private player: PlayerMotionState;
   private previousJump = false;
+  private jumpGrace = EMPTY_JUMP_GRACE;
+  private readonly forgivingJump: boolean;
   private tickId = 0;
   private accumulatorSeconds = 0;
   private checkpoint: ForestGrayboxCheckpoint;
@@ -90,6 +96,7 @@ export class ForestGrayboxRuntime {
   public constructor(options: ForestGrayboxRuntimeOptions) {
     validateForestRegion(options.manifest, options.region);
     this.manifest = options.manifest;
+    this.forgivingJump = options.openingSurface === true;
     this.seed = options.region.seed;
     this.topologyDigest = options.region.topologyDigest;
     this.fixedHz = options.fixedHz ?? 60;
@@ -115,6 +122,8 @@ export class ForestGrayboxRuntime {
     };
     this.chunkStream = new ForestChunkStream(options.manifest, options.region, {
       maxRetainedChunks: options.maxRetainedChunks,
+      openingSurface: options.openingSurface,
+      materialOverlay: options.materialOverlay,
     });
     this.recoveryClearanceVolumes = arrivalRecoveryComponent(options.region, this.body);
     this.meadowSurfaces = options.region.meadowSurfaces;
@@ -144,7 +153,7 @@ export class ForestGrayboxRuntime {
       save.accumulatorSeconds < 0 || save.accumulatorSeconds >= runtime.fixedSeconds) {
       throw new Error("forest graybox save timing is invalid");
     }
-    if (typeof save.previousJump !== "boolean" || !isSavedMotionState(save.player) ||
+    if (typeof save.previousJump !== "boolean" || !isSavedJumpGrace(save.jumpGrace) || !isSavedMotionState(save.player) ||
       !isSavedCamera(save.camera, runtime.manifest) ||
       !cameraContainsPlayer(save.camera, save.player, runtime.body) ||
       !isSavedCheckpoint(save.checkpoint) ||
@@ -155,10 +164,15 @@ export class ForestGrayboxRuntime {
       !runtime.hasRecoveryRoute({ x: save.player.x, y: save.player.y }) ||
       runtime.chunkStream.isSolid({ ...save.checkpoint.position, ...runtime.body }) ||
       !runtime.hasRecoveryRoute(save.checkpoint.position)) {
-      throw new Error("forest graybox save state is invalid");
+      const reason=runtime.chunkStream.isSolid({ x: save.player.x, y: save.player.y, ...runtime.body })?'player collision':
+        !runtime.hasRecoveryRoute({x:save.player.x,y:save.player.y})?'player recovery':
+        !isSavedMotionState(save.player)?'player velocity':
+        !isSavedJumpGrace(save.jumpGrace)?'jump timing':'camera/checkpoint/causality';
+      throw new Error("forest graybox save state is invalid ("+reason+")");
     }
     runtime.player = Object.freeze({ ...save.player });
     runtime.previousJump = save.previousJump;
+    runtime.jumpGrace = Object.freeze({ ...(save.jumpGrace ?? EMPTY_JUMP_GRACE) });
     runtime.tickId = save.tick;
     runtime.accumulatorSeconds = save.accumulatorSeconds;
     runtime.camera = Object.freeze({ ...save.camera });
@@ -202,11 +216,11 @@ export class ForestGrayboxRuntime {
     return freezePlayer(this.player, this.body);
   }
 
-  public visibleMaterialChunks(): readonly ForestMaterialChunk[] {
-    const key = `${Math.floor(this.camera.x / 16)},${Math.floor(this.camera.y / 16)},` +
-      `${Math.ceil((this.camera.x + this.camera.width) / 16)},${Math.ceil((this.camera.y + this.camera.height) / 16)}`;
+  public visibleMaterialChunks(camera: Aabb = this.camera): readonly ForestMaterialChunk[] {
+    const key = `${this.chunkStream.visibleRevision(camera)}:${Math.floor(camera.x / 16)},${Math.floor(camera.y / 16)},` +
+      `${Math.ceil((camera.x + camera.width) / 16)},${Math.ceil((camera.y + camera.height) / 16)}`;
     if (this.visibleMaterialCache?.key === key) return this.visibleMaterialCache.chunks;
-    const chunks = this.chunkStream.visible(this.camera, 0);
+    const chunks = this.chunkStream.visible(camera, 1);
     this.visibleMaterialCache = Object.freeze({ key, chunks });
     return chunks;
   }
@@ -225,7 +239,9 @@ export class ForestGrayboxRuntime {
         body: player.body,
       },
       camera,
+      ...this.savedJumpGrace(),
     };
+    let stateDigest: `sha256:${string}` | undefined;
     return Object.freeze({
       tick: this.tickId,
       seed: this.seed,
@@ -233,7 +249,7 @@ export class ForestGrayboxRuntime {
       player,
       camera,
       checkpoint,
-      stateDigest: sha256Canonical(digestPayload as unknown as JsonValue),
+      get stateDigest() { return stateDigest ??= sha256Canonical(digestPayload as unknown as JsonValue); },
     });
   }
 
@@ -246,6 +262,7 @@ export class ForestGrayboxRuntime {
       tick: this.tickId,
       accumulatorSeconds: this.accumulatorSeconds,
       previousJump: this.previousJump,
+      ...this.savedJumpGrace(),
       player: Object.freeze({ ...this.player }),
       camera: Object.freeze({ ...this.camera }),
       checkpoint: freezeCheckpoint(this.checkpoint),
@@ -277,6 +294,7 @@ export class ForestGrayboxRuntime {
       grounded: false,
     };
     this.previousJump = false;
+    this.jumpGrace = EMPTY_JUMP_GRACE;
     this.accumulatorSeconds = 0;
     this.camera = initializeForestCamera(
       this.manifest.camera,
@@ -286,6 +304,10 @@ export class ForestGrayboxRuntime {
     return this.snapshot();
   }
 
+  private savedJumpGrace(): { jumpGrace?: PlayerJumpGrace } {
+    return this.forgivingJump && (this.jumpGrace.coyote > 0 || this.jumpGrace.buffer > 0) ? { jumpGrace: this.jumpGrace } : {};
+  }
+
   private stepFixed(input: NormalizedRuntimeInput, additionalCollision?: (bounds: Aabb) => boolean): void {
     this.tickId += 1;
     const motion = stepPlayerMotion({
@@ -293,11 +315,14 @@ export class ForestGrayboxRuntime {
       body: this.body,
       input,
       previousJump: this.previousJump,
+      jumpGrace: this.forgivingJump ? this.jumpGrace : undefined,
       fixedSeconds: this.fixedSeconds,
+      immersion: this.chunkStream.playerImmersion({ ...this.player, ...this.body }),
       collides: (bounds) => this.chunkStream.isSolid(bounds) || additionalCollision?.(bounds) === true,
     });
     this.player = motion.state;
     this.previousJump = motion.previousJump;
+    this.jumpGrace = motion.jumpGrace ?? EMPTY_JUMP_GRACE;
     this.camera = this.nextCamera();
   }
 
@@ -314,6 +339,8 @@ export class ForestGrayboxRuntime {
   private hasRecoveryRoute(position: Vec2): boolean {
     const bounds = { ...position, ...this.body };
     return aabbCoveredByVolumes(bounds, this.recoveryClearanceVolumes) ||
+      this.chunkStream.hasDynamicRecovery(bounds) ||
+      this.chunkStream.hasOpeningSurfaceRecovery(bounds) ||
       this.meadowSurfaces.some((surface) =>
         bounds.x >= surface.left && bounds.x + bounds.width <= surface.right &&
         bounds.y >= 0 && bounds.y + bounds.height <= surface.y);
@@ -325,6 +352,12 @@ function normalizeInput(input: RuntimeInput): NormalizedRuntimeInput {
     moveX: normalizeMoveAxis(input.moveX),
     jump: input.jump === true,
   });
+}
+
+function isSavedJumpGrace(value: PlayerJumpGrace | undefined): boolean {
+  return value === undefined || (value !== null &&
+    Number.isFinite(value.coyote) && value.coyote >= 0 && value.coyote <= PLAYER_JUMP_GRACE.coyote &&
+    Number.isFinite(value.buffer) && value.buffer >= 0 && value.buffer <= PLAYER_JUMP_GRACE.buffer);
 }
 
 function isSavedMotionState(value: PlayerMotionState): boolean {
@@ -347,7 +380,7 @@ function isCausallyReachable(
 }
 
 function isSavedCamera(value: ForestCameraState, manifest: RuntimeForestSpatialManifest): boolean {
-  return Number.isInteger(value.x) && Number.isInteger(value.y) &&
+  return Number.isFinite(value.x) && Number.isFinite(value.y) &&
     value.x >= 0 && value.y >= 0 &&
     value.x <= manifest.regionBoundsPx.width - manifest.viewportPx.width &&
     value.y <= manifest.regionBoundsPx.height - manifest.viewportPx.height &&

@@ -8,7 +8,8 @@ const ARRIVAL = "scene.valley.arrival_shelf";
 const STREAM = "scene.valley.stream_section";
 const SETTLEMENT = "scene.valley.settlement";
 const WATERWHEEL = "scene.valley.waterwheel";
-const SERVICE_CHANNEL = "scene.valley.service_channel";
+// N04 is the lower-maintenance subarea of the existing waterwheel map.
+const SERVICE_CHANNEL = WATERWHEEL;
 const CISTERN = "scene.valley.high_cistern";
 const RETURN_CHANNEL = "scene.valley.return_channel";
 const SAFE_RANGE = "scene.valley.safe_range";
@@ -460,13 +461,7 @@ test("flushes a checked envelope on pagehide and keeps the touch controls labell
   expect(errors).toEqual([]);
 });
 
-test("completes N07, the optional production N08 trial, and the old-mine threshold", async ({ page }) => {
-  // This is the full keyboard-driven N07 -> N08 -> old-mine journey, not a
-  // single interaction check. Keep its budget separate from the short smoke
-  // tests so slower CI hosts do not terminate a healthy route mid-movement.
-  test.setTimeout(720_000);
-  const errors: string[] = [];
-  page.on("pageerror", (error) => errors.push(error.message));
+async function reachCompletedN07(page: Page): Promise<void> {
   await clearAndOpen(page);
 
   await holdKeyboardRightUntil(page, STREAM);
@@ -486,6 +481,10 @@ test("completes N07, the optional production N08 trial, and the old-mine thresho
   await clickEnabled(page, '[data-wheel-solution="waterwheel.repair_axle"]');
   await clickEnabled(page, '[data-infra-command="enter_service"]');
   await expectModeAndScene(page, "infrastructure", SERVICE_CHANNEL);
+  await expect.poll(async()=>page.evaluate(key=>{
+    const save=JSON.parse(localStorage.getItem(key)??'{}');
+    return save.session?.state?.checkpoint?.id;
+  },PRIMARY_KEY)).toBe('checkpoint.valley.waterwheel.lower_maintenance.entry');
   await clickEnabled(page, '[data-service-solution="service.open_bypass_valve"]');
   await expect(page.locator("[data-cistern-ready]")).toHaveText("ready");
 
@@ -530,6 +529,32 @@ test("completes N07, the optional production N08 trial, and the old-mine thresho
   await page.reload();
   await expectModeAndScene(page, "return_flow", RETURN_CHANNEL);
   await expect(page.locator("[data-core120-learning-count]")).toHaveText("3 / 600");
+}
+
+test("completes N07 and preserves the unfinished underground handoff boundary", async ({ page }) => {
+  test.setTimeout(240_000);
+  const errors: string[]=[];
+  page.on('pageerror',error=>errors.push(error.message));
+  await reachCompletedN07(page);
+  const checkpoint=await page.evaluate(key=>JSON.parse(localStorage.getItem(key)!).session.state.checkpoint,PRIMARY_KEY);
+  await clickEnabled(page, '[data-return-intent="return_settlement"]');
+  await expect(page.locator('[data-ui="status"]')).toContainText('underground_handoff_required');
+  await expectModeAndScene(page,'return_flow',RETURN_CHANNEL);
+  await page.reload();
+  await expectModeAndScene(page,'return_flow',RETURN_CHANNEL);
+  await expect(page.locator('[data-core120-learning-count]')).toHaveText('3 / 600');
+  expect(await page.evaluate(key=>JSON.parse(localStorage.getItem(key)!).session.state.checkpoint,PRIMARY_KEY)).toEqual(checkpoint);
+  expect(errors).toEqual([]);
+});
+
+// Keep the downstream scenario visible, not deleted or counted as passing.
+// It requires a future legitimate entry through the underground node; the
+// old direct N07 -> N02 shortcut is intentionally rejected by current design.
+test.skip("N08 and old-mine browser journey awaits the underground handoff entry", async ({ page }) => {
+  test.setTimeout(720_000);
+  const errors: string[]=[];
+  page.on('pageerror',error=>errors.push(error.message));
+  await reachCompletedN07(page);
   await clickEnabled(page, '[data-return-intent="return_settlement"]');
   await expectModeAndScene(page, "settlement", SETTLEMENT);
   await expect(page.locator("[data-p0-learning-count]")).toHaveText("12 / 12");

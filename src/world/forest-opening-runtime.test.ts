@@ -10,7 +10,7 @@ const openingManifest = readRuntimeForestOpeningManifest(generated);
 const spatialManifest = readRuntimeForestSpatialManifest(generated);
 
 function fresh(seed = "forest.opening.runtime"): ForestOpeningRuntime {
-  return ForestOpeningRuntime.fresh({ openingManifest, spatialManifest, seed });
+  return ForestOpeningRuntime.fresh({ openingManifest, spatialManifest, seed, physics: 'shared' });
 }
 
 function resign(save: ForestOpeningRuntimeSave): ForestOpeningRuntimeSave {
@@ -19,6 +19,39 @@ function resign(save: ForestOpeningRuntimeSave): ForestOpeningRuntimeSave {
 }
 
 describe("ForestOpeningRuntime", () => {
+  it("keeps the integrated material and ecology timeline identical at 30 and 60 display frames", () => {
+    const options={ openingManifest, spatialManifest, seed: 'integrated.display-rate' };
+    const low=ForestOpeningRuntime.fresh(options), high=ForestOpeningRuntime.fresh(options);
+    for(let i=0;i<60;i++) low.advanceFrame(1/30,{moveX:1});
+    for(let i=0;i<120;i++) high.advanceFrame(1/60,{moveX:1});
+    expect(low.save()).toEqual(high.save());
+    expect(low.save().obstacle.creek?.schema).toBe('tokipona.forest-creek.v0.2');
+  });
+  it("accepts old envelopes without jump timing but rejects extra nested timing fields", () => {
+    const source = fresh("forest.opening.legacy-jump-timing");
+    source.advanceTicks(120);
+    const current = source.save();
+    const { jumpGrace: _timing, ...legacySpatial } = current.spatial;
+    const legacy = resign({ ...current, spatial: legacySpatial });
+    const loaded = ForestOpeningRuntime.fromSave({ openingManifest, spatialManifest }, legacy);
+    expect(loaded.save()).toEqual(legacy);
+    expect(loaded.snapshot().spatial.player).toEqual(source.snapshot().spatial.player);
+    const extra = resign({ ...current, spatial: { ...current.spatial,
+      jumpGrace: { coyote: 0.1, buffer: 0, extra: true } } } as never);
+    expect(() => ForestOpeningRuntime.fromSave({ openingManifest, spatialManifest }, extra)).toThrow(/fields/);
+  });
+
+  it("restores an unconsumed airborne jump buffer on the same physics timeline", () => {
+    const source = fresh("forest.opening.buffer-save");
+    source.advanceTicks(1, { jump: true });
+    expect(source.save().spatial.jumpGrace?.buffer).toBe(0.12);
+    const loaded = ForestOpeningRuntime.fromSave({ openingManifest, spatialManifest }, source.save());
+    for (let tick = 0; tick < 40; tick++) {
+      source.advanceTicks(1);
+      loaded.advanceTicks(1);
+      expect(loaded.snapshot()).toEqual(source.snapshot());
+    }
+  });
   it("creates byte-stable fresh state from verified manifests and a seed", () => {
     const first = fresh().save();
     const second = fresh().save();
@@ -177,7 +210,7 @@ describe("ForestOpeningRuntime", () => {
       rabbit: { mode: "foraging" },
       wetlandBird: { mode: "wading" },
     });
-  });
+  }, 15_000); // Up to 2,100 simulated ticks plus save/restore; not a frame-time benchmark.
 
   it("keeps an uncommitted checkpoint reset on one recoverable material timeline", () => {
     const source = fresh("forest.opening.uncommitted-reset");

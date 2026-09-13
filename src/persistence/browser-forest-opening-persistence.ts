@@ -143,10 +143,18 @@ export class BrowserForestOpeningPersistence {
     page: PageHideTarget,
     visibility: VisibilityTarget,
     current: () => PrologueForestOpeningSession | null,
+    onResult?: (saved: boolean) => void,
   ): () => void {
     const flush = (): void => {
       const session = current();
-      if (session !== null) this.save(session);
+      if (session === null) return;
+      try { this.save(session); }
+      catch (error) {
+        if (!onResult) throw error;
+        onResult(false);
+        return;
+      }
+      onResult?.(true);
     };
     const hidden = (): void => { if (visibility.visibilityState === "hidden") flush(); };
     page.addEventListener("pagehide", flush);

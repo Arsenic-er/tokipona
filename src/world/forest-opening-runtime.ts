@@ -8,6 +8,7 @@ import {
   type RuntimeForestSpatialManifest,
 } from "../content/runtime-forest-spatial-manifest";
 import type { RuntimeInput } from "../runtime";
+import type { Aabb } from "../runtime/geometry";
 import {
   ForestOpeningObstacle,
   type ForestOpeningInteraction,
@@ -58,6 +59,7 @@ export interface ForestOpeningRuntimeFreshOptions {
   readonly openingManifest: RuntimeForestOpeningManifest;
   readonly spatialManifest: RuntimeForestSpatialManifest;
   readonly seed: string;
+  readonly physics?: 'shared' | 'integrated';
 }
 
 export interface ForestOpeningRuntimeRestoreOptions {
@@ -87,7 +89,10 @@ export class ForestOpeningRuntime {
     assertVerifiedManifests(options.openingManifest, options.spatialManifest);
     if (!options.seed.trim()) throw new Error("forest opening seed must not be empty");
     const region = generateForestRegion(options.spatialManifest, options.seed);
-    const spatial = new ForestGrayboxRuntime({ manifest: options.spatialManifest, region });
+    const obstacle = ForestOpeningObstacle.fresh(options.openingManifest, options.physics==='shared'?true:'integrated');
+    const spatial = new ForestGrayboxRuntime({ manifest: options.spatialManifest, region, openingSurface: true,
+      materialOverlay: obstacle.creek ?? undefined });
+    obstacle.creek?.bindTerrain((x,y)=>spatial.chunkStream.baseMaterialAt(x,y));
     const creaturePlacement = createForestOpeningCreaturePlacement(
       options.spatialManifest,
       spatial.chunkStream,
@@ -95,7 +100,7 @@ export class ForestOpeningRuntime {
     return new ForestOpeningRuntime(
       options.openingManifest,
       spatial,
-      ForestOpeningObstacle.fresh(options.openingManifest),
+      obstacle,
       ForestOpeningEcology.fresh(
         options.openingManifest,
         `${options.seed}:ecology`,
@@ -114,16 +119,20 @@ export class ForestOpeningRuntime {
       throw new Error("forest opening save manifest mismatch");
     }
     const region = generateForestRegion(options.spatialManifest, save.spatial.seed);
+    const obstacle = ForestOpeningObstacle.fromSave(options.openingManifest, save.obstacle);
     const spatial = ForestGrayboxRuntime.fromSave(
-      { manifest: options.spatialManifest, region },
+      { manifest: options.spatialManifest, region, openingSurface: true, materialOverlay: obstacle.creek ?? undefined },
       save.spatial,
     );
+    obstacle.creek?.bindTerrain((x,y)=>spatial.chunkStream.baseMaterialAt(x,y));
+    if(obstacle.integrated && obstacle.creek!.bodyStates.some(body=>obstacle.creek!.bodySolid(body,body.id))) {
+      throw new Error('saved forest body overlaps terrain or another body');
+    }
     const creaturePlacement = createForestOpeningCreaturePlacement(
       options.spatialManifest,
       spatial.chunkStream,
     );
-    const obstacle = ForestOpeningObstacle.fromSave(options.openingManifest, save.obstacle);
-    assertNoUnsolvedCrossing(options.openingManifest, save.spatial, obstacle.snapshot());
+    if(!obstacle.integrated) assertNoUnsolvedCrossing(options.openingManifest, save.spatial, obstacle.snapshot());
     const expectedWorldMinute = worldMinuteAtTick(save.spatial.tick);
     if (save.worldMinute !== expectedWorldMinute || save.ecology.tick !== save.spatial.tick ||
         obstacle.snapshot().materialPocket.tick !== save.spatial.tick) {
@@ -139,9 +148,9 @@ export class ForestOpeningRuntime {
 
   public advanceFrame(elapsedSeconds: number, input: RuntimeInput = {}): number {
     const steps = this.spatialRuntime.advanceFrame(elapsedSeconds, input, () => {
+      this.stepObstacle();
       this.ecology.advanceTicks(1, this.currentPerception());
     }, (bounds) => this.obstacle.blocksTraversal(bounds));
-    this.obstacle.advanceTicks(steps);
     return steps;
   }
 
@@ -149,9 +158,9 @@ export class ForestOpeningRuntime {
     if (!Number.isSafeInteger(ticks) || ticks < 0) throw new Error("forest opening ticks must be non-negative");
     for (let tick = 0; tick < ticks; tick += 1) {
       this.spatialRuntime.advanceTicks(1, input, (bounds) => this.obstacle.blocksTraversal(bounds));
+      this.stepObstacle();
       this.ecology.advanceTicks(1, this.currentPerception());
     }
-    this.obstacle.advanceTicks(ticks);
     return this.snapshot();
   }
 
@@ -174,6 +183,13 @@ export class ForestOpeningRuntime {
     return result;
   }
 
+  private stepObstacle(): void {
+    const player=this.spatialRuntime.playerSnapshot();
+    this.obstacle.stepTick({...player.position,...player.body},player.grounded);
+  }
+
+  public rejectPendingCrossing():void { this.obstacle.rejectPendingCrossing(); }
+
   public setCheckpoint(id: string): ForestGrayboxCheckpoint {
     return this.spatialRuntime.setCheckpoint(id);
   }
@@ -191,8 +207,10 @@ export class ForestOpeningRuntime {
     const obstacle = this.obstacle.snapshot();
     const ecology = this.ecology.snapshot();
     const worldMinute = worldMinuteAtTick(spatial.tick);
-    const stateDigest = sha256Canonical({
-      manifestDigest: this.openingManifest.sourceDigest,
+    const manifestDigest = this.openingManifest.sourceDigest;
+    let stateDigest: `sha256:${string}` | undefined;
+    const getDigest = () => stateDigest ??= sha256Canonical({
+      manifestDigest,
       worldMinute,
       spatialStateDigest: spatial.stateDigest,
       obstacleStateDigest: obstacle.stateDigest,
@@ -204,12 +222,12 @@ export class ForestOpeningRuntime {
       spatial,
       obstacle,
       ecology,
-      stateDigest,
+      get stateDigest() { return getDigest(); },
     });
   }
 
-  public visibleMaterialChunks(): readonly ForestMaterialChunk[] {
-    return this.spatialRuntime.visibleMaterialChunks();
+  public visibleMaterialChunks(camera?: Aabb): readonly ForestMaterialChunk[] {
+    return this.spatialRuntime.visibleMaterialChunks(camera);
   }
 
   public save(): ForestOpeningRuntimeSave {
@@ -283,7 +301,9 @@ function readSave(
 
 function readSpatialSave(value: unknown): ForestGrayboxSave {
   const raw = record(value, "forest opening spatial save");
-  exactKeys(raw, ["schema", "seed", "topologyDigest", "fixedHz", "tick", "accumulatorSeconds", "previousJump", "player", "camera", "checkpoint"], "forest opening spatial save");
+  exactKeys(raw, ["schema", "seed", "topologyDigest", "fixedHz", "tick", "accumulatorSeconds", "previousJump", "player", "camera", "checkpoint",
+    ...("jumpGrace" in raw ? ["jumpGrace"] : [])], "forest opening spatial save");
+  if ("jumpGrace" in raw) exactKeys(record(raw.jumpGrace, "jump grace"), ["coyote", "buffer"], "jump grace");
   exactKeys(record(raw.player, "forest opening player save"), ["x", "y", "velocityX", "velocityY", "grounded"], "forest opening player save");
   exactKeys(record(raw.camera, "forest opening camera save"), ["x", "y", "width", "height", "facing"], "forest opening camera save");
   const checkpoint = record(raw.checkpoint, "forest opening checkpoint save");

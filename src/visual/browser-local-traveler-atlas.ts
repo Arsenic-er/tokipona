@@ -1,4 +1,6 @@
 import type { ForestOpeningPublicView } from "./forest-opening-view";
+import { ForestTravelerLanding } from "./forest-traveler-landing";
+const landings = new WeakMap<CanvasRenderingContext2D, ForestTravelerLanding>();
 
 export interface LocalTravelerAtlas {
   readonly image: CanvasImageSource & Readonly<{ naturalWidth: number; naturalHeight: number }>;
@@ -33,7 +35,7 @@ export async function loadBrowserLocalTravelerAtlas(
 }
 
 export function loadBrowserLocalTravelerAtlasFromDocument(): Promise<LocalTravelerAtlasLoadResult> {
-  return loadBrowserLocalTravelerAtlas(import.meta.env.DEV, (url) => new Promise((resolve, reject) => {
+  return loadBrowserLocalTravelerAtlas(import.meta.env.DEV || __TOKIPONA_LOCAL_DESKTOP__, (url) => new Promise((resolve, reject) => {
     const image = new Image();
     image.decoding = "async";
     image.onload = () => resolve(image as LocalTravelerAtlas["image"]);
@@ -47,7 +49,10 @@ export function drawForestOpeningLocalTraveler(
   view: ForestOpeningPublicView,
   atlas: LocalTravelerAtlas,
 ): void {
-  const frame = frameFor(view);
+  let landing = landings.get(context);
+  if (!landing) { landing = new ForestTravelerLanding(); landings.set(context, landing); }
+  const landingFrame = landing.frame(view);
+  const frame = landingFrame === null ? frameFor(view) : { column: landingFrame, row: 2 };
   const destination = localTravelerBounds(view);
   context.save();
   if (view.traveler.facing < 0) {

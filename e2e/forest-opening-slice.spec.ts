@@ -1,5 +1,7 @@
 import { expect, test, type Page } from "@playwright/test";
 import { runtimeForestOpeningAssetExport } from "../src/assets/runtime-forest-opening-assets";
+import type { ForestCreekSave } from '../src/world/forest-opening-creek';
+import { readFileSync } from 'node:fs';
 
 const SAVE_KEY = "tokipona.forest-opening.vertical-slice.v0.1";
 const MUTE_KEY = "tokipona.forest-opening.audio-muted.v0.1";
@@ -61,24 +63,29 @@ for (const profile of [
   });
 }
 
-test.describe("desktop 1440x900 complete routes", () => {
+test.describe("legacy v0.1 desktop 1440x900 saved-world compatibility", () => {
   test.use({ viewport: { width: 1_440, height: 900 }, hasTouch: false });
   for (const route of [
     { solutionId: "stone_steps", prompt: "E · 推动松石", interactions: 2 },
     { solutionId: "deadwood_bridge", prompt: "E · 拖动枯木", interactions: 1 },
-    { solutionId: "shallow_detour", prompt: "E · 涉水绕行", interactions: 1 },
+    { solutionId: "shallow_detour", prompt: "E · 疏通松土", interactions: 1 },
   ] as const) {
     test(`completes ${route.solutionId} from a clean browser save without teaching telo`, async ({ page, context }, testInfo) => {
-      test.setTimeout(90_000);
+      test.setTimeout(180_000); // Includes a checkpoint replay and durable save checks on the reference laptop.
       const errors: string[] = [];
       const rabbitModes = new Set<string>();
       collectBrowserErrors(page, errors);
-      await page.clock.install();
-      await page.goto("/chapter-one.html");
+      await openWithControlledClock(page);
       const initialSave = await readOpeningSave(page);
       const canvas = page.locator('canvas[data-surface="game"]');
       await canvas.focus();
       await moveUntilPrompt(page, route.prompt, rabbitModes);
+      if (route.solutionId === 'shallow_detour') {
+        const beforeTool = await readOpeningSave(page);
+        expect(beforeTool.spatial.obstacle.creek?.excavatedSoil).toBe(0);
+        expect(beforeTool.spatial.obstacle.creek?.grid.material.filter(m => m === 4)).toHaveLength(400);
+        expect(beforeTool.spatial.obstacle.creek?.grid.material.some((m, i) => m === 4 && i % 128 >= 72)).toBe(false);
+      }
       await assertTravelerVisible(page);
       await page.screenshot({ path: testInfo.outputPath(`${route.solutionId}-obstacle.png`) });
       for (let index = 0; index < route.interactions; index += 1) {
@@ -90,6 +97,19 @@ test.describe("desktop 1440x900 complete routes", () => {
         await recordRabbitMode(page, rabbitModes);
       }
       await expect(page.locator('[data-hud="objective"]')).toHaveText("继续向东，抵达林间聚落");
+      if (route.solutionId === 'shallow_detour') {
+        await page.clock.fastForward(1000);
+        await page.clock.fastForward(1000);
+        const flowing = await readOpeningSave(page);
+        expect(flowing.spatial.obstacle.creek?.excavatedSoil).toBe(96);
+        expect(flowing.spatial.obstacle.creek?.grid.material.filter(m => m === 4)).toHaveLength(400);
+        expect(flowing.spatial.obstacle.creek?.grid.material.some((m, i) =>
+          m === 4 && i % 128 >= 72 && Math.floor(i / 128) >= 24)).toBe(true);
+        await page.screenshot({ path: testInfo.outputPath('creek-after-excavation.png') });
+        await page.reload();
+        const reloaded = await readOpeningSave(page);
+        expect(reloaded.spatial.obstacle.creek).toEqual(flowing.spatial.obstacle.creek);
+      }
       if (route.solutionId === "deadwood_bridge") {
         const beforeReset = await readOpeningSave(page);
         await page.getByRole("button", { name: "暂停" }).click();
@@ -103,9 +123,31 @@ test.describe("desktop 1440x900 complete routes", () => {
       await moveUntilPrompt(page, "F · 观察未知刻痕", rabbitModes);
       await page.keyboard.press("f");
       await page.clock.fastForward(17);
+      if (route.solutionId === "shallow_detour") {
+        // Simulate a storage failure, not a different game state. The route is
+        // still traversed normally; no position/quest mutation is exposed.
+        await page.evaluate(key => {
+          const write = Storage.prototype.setItem;
+          Storage.prototype.setItem = function (name, value) {
+            if (name === key && sessionStorage.getItem("test.block-save") === "yes") throw new Error("test quota");
+            write.call(this, name, value);
+          };
+          sessionStorage.setItem("test.block-save", "yes");
+        }, SAVE_KEY);
+      }
       await moveUntilSettlement(page, rabbitModes);
       await expect(page.locator('[data-hud="objective"]')).toHaveText(SETTLEMENT_OBJECTIVE);
+      const ending = page.getByRole("region", { name: "短旅程结算" });
+      await expect(ending).toBeVisible();
+      await expect(ending).toContainText("读音与含义未知");
+      if (route.solutionId === "shallow_detour") {
+        await expect(ending).toContainText("尚未写入成功");
+        await page.evaluate(() => sessionStorage.setItem("test.block-save", "no"));
+        await page.getByRole("button", { name: "重试保存" }).click();
+      }
+      await expect(ending).toContainText("已保存 · 重新打开会留在这里");
       const beforeReload = await readOpeningSave(page);
+      expect(beforeReload.spatial.spatial.player).toMatchObject({ grounded: true, velocityX: 0, velocityY: 0 });
       expect(beforeReload.spatial.obstacle.committedSolutionId).toBe(route.solutionId);
       expect(beforeReload.session.state.mp).toMatchObject({ currentMp: 12, maxMp: 24 });
       expect(beforeReload.session.state.capabilities).toEqual(initialSave.session.state.capabilities);
@@ -127,21 +169,52 @@ test.describe("desktop 1440x900 complete routes", () => {
       await resumedPage.goto("/chapter-one.html");
       await expect(resumedPage.locator('[data-hud="objective"]')).toHaveText(SETTLEMENT_OBJECTIVE);
       expect(await readOpeningSave(resumedPage)).toEqual(beforeReload);
+      await expect(resumedPage.getByRole("region", { name: "短旅程结算" })).toBeVisible();
+      await assertSettledPageIsQuiet(resumedPage);
+      if (route.solutionId === "shallow_detour") {
+        for (let replay = 0; replay < 3; replay += 1) {
+          const mainBytes = await resumedPage.evaluate(key => localStorage.getItem(key), SAVE_KEY);
+          await resumedPage.getByRole("button", { name: "临时重玩（不改主存档）" }).click();
+          await expect(resumedPage).toHaveURL(/chapter-one\.html\?practice=[0-9a-f]{32}$/);
+          await expect(resumedPage.locator('[data-hud="objective"]')).toHaveText(OPENING_OBJECTIVE);
+          await expect(resumedPage.getByRole("button", { name: "旅途笔记（J）" })).toBeVisible();
+          await resumedPage.locator('canvas[data-surface="game"]').focus();
+          await resumedPage.keyboard.press("j");
+          const practiceBytes = await resumedPage.evaluate(key => {
+            window.dispatchEvent(new Event("pagehide"));
+            const slot = new URLSearchParams(location.search).get("practice");
+            return sessionStorage.getItem(`${key}.practice.${slot}`);
+          }, SAVE_KEY);
+          expect(practiceBytes).not.toBeNull();
+          expect(JSON.parse(practiceBytes!).spatial.obstacle.committedSolutionId).toBeNull();
+          expect(await resumedPage.evaluate(key => localStorage.getItem(key), SAVE_KEY)).toBe(mainBytes);
+          await resumedPage.reload();
+          await expect(resumedPage.getByRole("button", { name: "旅途笔记（J）" })).toBeVisible();
+          await resumedPage.getByRole("button", { name: "旅途笔记（J）" }).click();
+          await resumedPage.getByRole("link", { name: "返回主进度" }).click();
+          await expect(resumedPage.locator('[data-hud="objective"]')).toHaveText(SETTLEMENT_OBJECTIVE);
+          expect(await readOpeningSave(resumedPage)).toEqual(beforeReload);
+          await assertTravelerVisible(resumedPage);
+          await assertSettledPageIsQuiet(resumedPage);
+          await resumedPage.screenshot({ path: testInfo.outputPath(`main-return-${replay + 1}.png`) });
+        }
+        await resumedPage.setViewportSize({ width: 1024, height: 768 });
+        await assertTravelerVisible(resumedPage);
+        expect(await readOpeningSave(resumedPage)).toEqual(beforeReload);
+      }
       expect(errors).toEqual([]);
     });
   }
 
   test("keeps a partial stone solution valid across a reload and uses a fresh operation identity", async ({ page, context }) => {
-    await page.clock.install();
-    await page.goto("/chapter-one.html");
+    await openWithControlledClock(page);
     await moveUntilPrompt(page, "E · 推动松石");
     await page.keyboard.press("e");
     await page.clock.fastForward(17);
     expect((await readOpeningSave(page)).spatial.obstacle.committedSolutionId).toBeNull();
     await page.close();
     const resumed = await context.newPage();
-    await resumed.clock.install();
-    await resumed.goto("/chapter-one.html");
+    await openWithControlledClock(resumed);
     await moveUntilPrompt(resumed, "E · 推动松石");
     await resumed.keyboard.press("e");
     await resumed.clock.fastForward(17);
@@ -166,9 +239,56 @@ test.describe("desktop 1440x900 complete routes", () => {
     await expect(page.getByRole("button", { name: "暂停" })).toHaveAttribute("aria-pressed", "false");
   });
 
+  test("opens journey notes with J and releases movement while reading", async ({ page }) => {
+    await openWithControlledClock(page);
+    await page.locator('canvas[data-surface="game"]').focus();
+    await page.keyboard.down("d");
+    await page.clock.fastForward(500);
+    await page.keyboard.press("j");
+    const journal = page.getByRole("dialog", { name: "旅途笔记" });
+    await expect(journal).toBeVisible();
+    await expect(journal).toContainText("不会直接学会道本语");
+    await page.evaluate(() => window.dispatchEvent(new Event("pagehide")));
+    const before = await readOpeningSave(page);
+    await page.clock.fastForward(3000);
+    await page.evaluate(() => window.dispatchEvent(new Event("pagehide")));
+    expect(await readOpeningSave(page)).toEqual(before);
+    await page.keyboard.press("Escape");
+    await expect(journal).toBeHidden();
+    await expect(page.locator("dialog.forest-opening__pause")).toBeHidden();
+    await page.clock.fastForward(1500);
+    await page.evaluate(() => window.dispatchEvent(new Event("pagehide")));
+    const after = await readOpeningSave(page);
+    expect(Math.abs(after.spatial.spatial.player.x - before.spatial.spatial.player.x)).toBeLessThan(15);
+    await page.keyboard.up("d");
+  });
+
+  test("offers a fresh creek practice from the journal before completion without overwriting main progress", async ({ page }) => {
+    await openWithControlledClock(page);
+    await page.getByRole("button", { name: "旅途笔记（J）" }).click();
+    await page.evaluate(() => window.dispatchEvent(new Event("pagehide")));
+    const mainBytes = await page.evaluate(key => localStorage.getItem(key), SAVE_KEY);
+    await page.getByRole("dialog", { name: "旅途笔记" })
+      .getByRole("button", { name: "临时重玩（不改主存档）" }).click();
+    await expect(page).toHaveURL(/chapter-one\.html\?practice=[0-9a-f]{32}$/);
+    await expect(page.locator('[data-hud="objective"]')).toHaveText(OPENING_OBJECTIVE);
+    await page.getByRole("button", { name: "旅途笔记（J）" }).click();
+    const temporary = await page.evaluate(key => {
+      window.dispatchEvent(new Event("pagehide"));
+      return sessionStorage.getItem(`${key}.practice.${new URLSearchParams(location.search).get("practice")}`);
+    }, SAVE_KEY);
+    expect(JSON.parse(temporary!).spatial.obstacle.creek.excavatedSoil).toBe(0);
+    expect(JSON.parse(temporary!).spatial.obstacle.creek.grid.material.filter((m: number) => m === 4)).toHaveLength(400);
+    expect(await page.evaluate(key => localStorage.getItem(key), SAVE_KEY)).toBe(mainBytes);
+    await page.getByRole("link", { name: "返回主进度" }).click();
+    await expect(page.locator('[data-hud="objective"]')).toHaveText(OPENING_OBJECTIVE);
+    const returned = await readOpeningSave(page);
+    expect(returned.session).toEqual(JSON.parse(mainBytes!).session);
+    expect(returned.spatial.spatial.player.x).toBe(JSON.parse(mainBytes!).spatial.spatial.player.x);
+  });
+
   test("reloads an uncommitted checkpoint reset on the same material timeline", async ({ page, context }) => {
-    await page.clock.install();
-    await page.goto("/chapter-one.html");
+    await openWithControlledClock(page);
     const canvas = page.locator('canvas[data-surface="game"]');
     await canvas.focus();
     await page.keyboard.down("d");
@@ -200,10 +320,9 @@ test.describe("mobile complete route", () => {
   test.use({ viewport: { width: 844, height: 390 }, hasTouch: true });
   test("uses touch controls through the shallow route and restores the committed save", async ({ page }, testInfo) => {
     test.setTimeout(90_000);
-    await page.clock.install();
-    await page.goto("/chapter-one.html");
+    await openWithControlledClock(page);
     const initialSave = await readOpeningSave(page);
-    await moveUntilPromptByTouch(page, "E · 涉水绕行");
+    await moveUntilPromptByTouch(page, "E · 疏通松土");
     await assertTravelerVisible(page);
     await page.screenshot({ path: testInfo.outputPath("mobile-shallow-obstacle.png") });
     await page.getByRole("button", { name: "互动" }).tap();
@@ -212,7 +331,14 @@ test.describe("mobile complete route", () => {
     await moveUntilPromptByTouch(page, "F · 观察未知刻痕", true);
     await page.getByRole("button", { name: "观察" }).tap();
     await page.clock.fastForward(17);
+    await page.getByRole("button", { name: "旅途笔记（J）" }).tap();
+    const journal = page.getByRole("dialog", { name: "旅途笔记" });
+    await expect(journal).toBeVisible();
+    await expect(journal).toContainText("读音与含义未知");
+    await page.screenshot({ path: testInfo.outputPath("mobile-journey-notes.png") });
+    await page.getByRole("button", { name: "关闭旅途笔记" }).tap();
     await moveUntilSettlementByTouch(page);
+    await expect(page.getByRole("region", { name: "短旅程结算" })).toBeVisible();
     await assertTravelerVisible(page);
     await page.screenshot({ path: testInfo.outputPath("mobile-shallow-settlement.png") });
     const save = await readOpeningSave(page);
@@ -224,6 +350,26 @@ test.describe("mobile complete route", () => {
     await page.reload();
     await expect(page.locator('[data-hud="objective"]')).toHaveText(SETTLEMENT_OBJECTIVE);
   });
+});
+
+test("keeps a visible paused base scene and the original save when scene presentation fails to load", async ({ page }) => {
+  await openWithControlledClock(page);
+  await page.getByRole("button", { name: "旅途笔记（J）" }).click();
+  await page.evaluate(() => window.dispatchEvent(new Event("pagehide")));
+  const before = await readOpeningSave(page);
+  await page.route("**/assets/forest-opening-terrain-*.js", route => route.abort());
+  await page.reload();
+  await expect(page.getByText("场景加载失败 · 请刷新重试（原存档保留）")).toBeVisible();
+  await page.locator('canvas[data-surface="game"]').focus();
+  await page.keyboard.down("d");
+  await page.clock.fastForward(3000);
+  await page.keyboard.up("d");
+  await page.evaluate(() => window.dispatchEvent(new Event("pagehide")));
+  expect(await readOpeningSave(page)).toEqual(before);
+  await assertTravelerVisible(page, true);
+  await page.unroute("**/assets/forest-opening-terrain-*.js");
+  await page.reload();
+  await expect(page.getByRole("button", { name: "旅途笔记（J）" })).toBeVisible();
 });
 
 test("keeps corrupt save bytes intact until the player explicitly resets them", async ({ page, context }) => {
@@ -251,6 +397,52 @@ test("keeps corrupt save bytes intact until the player explicitly resets them", 
   expect(JSON.parse(replacement ?? "null").schema).toBe("tokipona.browser-forest-opening.v0.1");
 });
 
+async function openWithControlledClock(page: Page): Promise<void> {
+  // Preserve the shipped v0.1 route semantics as a separate compatibility suite.
+  // Fresh v0.2 worlds are traversed end-to-end in forest-integrated.spec.ts.
+  const legacy=readFileSync('.codex-tmp/forest-legacy-fixture.json','utf8');
+  await page.addInitScript(({key,bytes})=>{
+    if(localStorage.getItem(key)===null) localStorage.setItem(key,bytes);
+  },{key:SAVE_KEY,bytes:legacy});
+  await page.clock.install({ time: 0 });
+  await page.goto("/chapter-one.html");
+  await expect(page.getByRole("button", { name: "旅途笔记（J）" })).toBeVisible();
+  // install() alone keeps wall time running during screenshots and protocol
+  // calls. Advance only explicitly so F/touch actions use the observed pose.
+  await page.clock.pauseAt(60_000);
+}
+
+async function assertSettledPageIsQuiet(page: Page): Promise<void> {
+  await page.clock.runFor(100);
+  const probe = await page.evaluateHandle(() => {
+    const context = document.querySelector<HTMLCanvasElement>('canvas[data-surface="game"]')!.getContext('2d')!;
+    const fill = context.fillRect;
+    const result = { mutations: 0, paints: 0, context, fill,
+      observer: new MutationObserver(records => { result.mutations += records.length; }) };
+    context.fillRect = function (x, y, width, height) { result.paints += 1; fill.call(this, x, y, width, height); };
+    result.observer.observe(document.querySelector('.forest-opening__hud')!, { subtree: true, childList: true, characterData: true });
+    return result;
+  });
+  await page.clock.runFor(250);
+  const idle = await probe.evaluate(result => {
+    const count = result.mutations + result.observer.takeRecords().length;
+    result.observer.disconnect();
+    return { mutations: count, paints: result.paints };
+  });
+  expect(idle.mutations, "an unchanged ending must not rewrite the HUD every frame").toBe(0);
+  expect(idle.paints, "an unchanged ending must not repaint the canvas every frame").toBe(0);
+  // Exercise cache invalidation after a context restoration notification.
+  // This is not a claim of testing an actual GPU loss.
+  await page.locator('canvas[data-surface="game"]').dispatchEvent('contextrestored');
+  const restoredPaints = await probe.evaluate(result => {
+    result.context.fillRect = result.fill;
+    return result.paints;
+  });
+  await probe.dispose();
+  expect(restoredPaints).toBeGreaterThan(0);
+  await assertTravelerVisible(page);
+}
+
 async function moveUntilPrompt(page: Page, wanted: string, rabbitModes?: Set<string>): Promise<void> {
   const prompt = page.locator('[data-hud="prompt"]');
   const sampleMilliseconds = 100;
@@ -266,7 +458,7 @@ async function moveUntilPrompt(page: Page, wanted: string, rabbitModes?: Set<str
       }
       if (sample % 12 === 0) await assertTravelerVisible(page);
       if (sample % 4 === 0) await recordRabbitMode(page, rabbitModes);
-      if (wanted !== "E · 涉水绕行" && sample > 0 && sample % 24 === 0) await page.keyboard.press("w");
+      if (wanted !== "E · 疏通松土" && sample > 0 && sample % 24 === 0) await page.keyboard.press("w");
     }
   } finally { await page.keyboard.up("d"); }
   throw new Error(`forest opening prompt was not reached: ${wanted}`);
@@ -349,7 +541,7 @@ async function beginTouchHold(page: Page, control: ReturnType<Page["locator"]>):
 interface BrowserOpeningSave {
   readonly acceptance: { readonly killCount: 0 };
   readonly spatial: {
-    readonly obstacle: { readonly committedSolutionId: string | null; readonly materialTick: number };
+    readonly obstacle: { readonly committedSolutionId: string | null; readonly materialTick: number; readonly creek?: ForestCreekSave };
     readonly ecology: { readonly rabbit: { readonly mode: string }; readonly wetlandBird: { readonly mode: string } };
     readonly spatial: {
       readonly tick: number;

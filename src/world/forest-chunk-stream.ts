@@ -14,6 +14,8 @@ export const FOREST_MATERIAL = Object.freeze({
   metal: 6,
   water: 7,
   vegetation: 8,
+  ember: 9,
+  ash: 10,
 } as const);
 
 export type ForestMaterial = typeof FOREST_MATERIAL[keyof typeof FOREST_MATERIAL];
@@ -27,6 +29,19 @@ export interface ForestMaterialChunk {
 
 export interface ForestChunkStreamOptions {
   readonly maxRetainedChunks?: number;
+  /** Open the authored arrival/stream route to the sky; other districts stay unchanged. */
+  readonly openingSurface?: boolean;
+  readonly materialOverlay?: ForestMaterialOverlay;
+}
+
+export interface ForestMaterialOverlay {
+  readonly bounds: Aabb;
+  readonly revision: number;
+  readonly solidRevision: number;
+  readonly retireStaticWater?: boolean;
+  playerImmersion?(bounds: Aabb): number;
+  affectsChunk?(bounds: Aabb): boolean;
+  materialAt(x: number, y: number): ForestMaterial | null;
 }
 
 const SOLID_MATERIALS: ReadonlySet<ForestMaterial> = new Set([
@@ -36,6 +51,7 @@ const SOLID_MATERIALS: ReadonlySet<ForestMaterial> = new Set([
   FOREST_MATERIAL.stone,
   FOREST_MATERIAL.wood,
   FOREST_MATERIAL.metal,
+  FOREST_MATERIAL.ember,
 ]);
 
 const EPSILON = 1e-7;
@@ -52,11 +68,15 @@ export class ForestChunkStream {
   readonly chunkHeight = 16 as const;
 
   private readonly retained = new Map<string, ForestMaterialChunk>();
+  private lastChunk: ForestMaterialChunk | null = null;
   private readonly sealedGates: readonly ForestRectPx[];
   private readonly clearanceVolumes: readonly ForestRectPx[];
   private readonly protectedMasses: readonly Readonly<{ kind: string; boundsPx: ForestRectPx }>[];
   private readonly maxRetainedChunks: number;
   private materializedCount = 0;
+  private readonly openingSurface: boolean;
+  private readonly openingHeights = new Int16Array(2496);
+  private readonly overlay?: ForestMaterialOverlay;
 
   public constructor(
     private readonly manifest: RuntimeForestSpatialManifest,
@@ -74,6 +94,32 @@ export class ForestChunkStream {
     this.protectedMasses = Object.freeze(region.protectedZones.filter((zone) =>
       zone.kind === "waterwheel_protected_mass" || zone.kind === "settlement_structure"));
     this.maxRetainedChunks = options.maxRetainedChunks ?? 2_048;
+    this.openingSurface = options.openingSurface === true;
+    this.overlay = options.materialOverlay;
+    const openingFloors = region.routeCorridors
+      .filter(({ edgeId }) => edgeId === "arrival.stream" || edgeId === "stream.settlement")
+      .flatMap(({ clearanceVolumesPx }) => clearanceVolumesPx);
+    if (this.openingSurface) for (let x = 0; x < this.openingHeights.length; x += 1) {
+      let floor = openingFloors[0]!.y + openingFloors[0]!.height;
+      for (const volume of openingFloors) {
+        if (x >= volume.x && x < volume.x + volume.width) floor = Math.max(floor, volume.y + volume.height);
+      }
+      this.openingHeights[x] = floor;
+    }
+    if (this.openingSurface) {
+      const terraces = this.openingHeights.slice();
+      for (let x = 0; x < this.openingHeights.length; x += 1) {
+        // Erode the upper corner of descending shelves, never fill old free
+        // route cells. Leave the existing quest-obstacle contact band untouched.
+        if (x >= 1720) continue;
+        let slope = terraces[x]!;
+        for (let ahead = 1; ahead <= 28 && x + ahead < terraces.length; ahead += 1) {
+          const drop = terraces[x + ahead]! - terraces[x]!;
+          if (drop > 0) slope = Math.max(slope, terraces[x]! + Math.floor(drop * (1 - ahead / 29)));
+        }
+        this.openingHeights[x] = slope + Math.round(1 + Math.sin(x / 17) * 0.6 + Math.sin(x / 5) * 0.4);
+      }
+    }
     if (!Number.isInteger(this.maxRetainedChunks) || this.maxRetainedChunks <= 0) {
       throw new Error("maxRetainedChunks must be a positive integer");
     }
@@ -93,7 +139,7 @@ export class ForestChunkStream {
     if (left > right || top > bottom) return Object.freeze(chunks);
     for (let chunkY = top; chunkY <= bottom; chunkY += 1) {
       for (let chunkX = left; chunkX <= right; chunkX += 1) {
-        chunks.push(copyChunk(this.chunkAt(chunkX, chunkY)));
+        chunks.push(this.overlayChunk(this.chunkAt(chunkX, chunkY)));
       }
     }
     return Object.freeze(chunks);
@@ -105,6 +151,14 @@ export class ForestChunkStream {
     }
     const pixelX = Math.floor(x);
     const pixelY = Math.floor(y);
+    const dynamic = this.overlay?.materialAt(pixelX, pixelY);
+    if (dynamic !== null && dynamic !== undefined) return dynamic;
+    return this.baseMaterialAt(pixelX,pixelY);
+  }
+
+  public baseMaterialAt(x:number,y:number): ForestMaterial {
+    if(!Number.isFinite(x) || !Number.isFinite(y) || !this.inBounds(x,y)) return FOREST_MATERIAL.protected_mass;
+    const pixelX=Math.floor(x), pixelY=Math.floor(y);
     const chunkX = Math.floor(pixelX / this.chunkWidth);
     const chunkY = Math.floor(pixelY / this.chunkHeight);
     const localX = pixelX - chunkX * this.chunkWidth;
@@ -118,9 +172,22 @@ export class ForestChunkStream {
     const right = Math.floor(bounds.x + bounds.width - EPSILON);
     const top = Math.floor(bounds.y);
     const bottom = Math.floor(bounds.y + bounds.height - EPSILON);
-    for (let y = top; y <= bottom; y += 1) {
-      for (let x = left; x <= right; x += 1) {
-        if (SOLID_MATERIALS.has(this.materialForPixel(x, y))) return true;
+    if (this.overlay && overlaps(bounds, this.overlay.bounds)) {
+      for (let y = top; y <= bottom; y++) for (let x = left; x <= right; x++) {
+        if (SOLID_MATERIALS.has(this.materialAt(x, y))) return true;
+      }
+      return false;
+    }
+    // Collision and visuals read the very same retained material bytes. Avoid
+    // regenerating route geology for every probe in the contact solver.
+    for (let cy = Math.floor(top / 16); cy <= Math.floor(bottom / 16); cy += 1) {
+      for (let cx = Math.floor(left / 16); cx <= Math.floor(right / 16); cx += 1) {
+        const materials = this.chunkAt(cx, cy).materials;
+        for (let y = Math.max(top, cy * 16); y <= Math.min(bottom, cy * 16 + 15); y += 1) {
+          for (let x = Math.max(left, cx * 16); x <= Math.min(right, cx * 16 + 15); x += 1) {
+            if (SOLID_MATERIALS.has(materials[(y - cy * 16) * 16 + x - cx * 16] as ForestMaterial)) return true;
+          }
+        }
       }
     }
     return false;
@@ -130,12 +197,56 @@ export class ForestChunkStream {
     return Object.freeze({ materialized: this.materializedCount, retained: this.retained.size });
   }
 
+  public get dynamicRevision(): number { return this.overlay?.revision ?? 0; }
+  public playerImmersion(bounds: Aabb): number { return this.overlay?.playerImmersion?.(bounds) ?? 0; }
+  public get solidRevision(): number { return this.overlay?.solidRevision ?? 0; }
+  public visibleRevision(camera: Aabb): number {
+    return this.overlay && overlaps(camera, this.overlay.bounds) ? this.dynamicRevision : 0;
+  }
+
+  public hasDynamicRecovery(bounds: Aabb): boolean {
+    return !!this.overlay && bounds.x >= this.overlay.bounds.x &&
+      bounds.x + bounds.width <= this.overlay.bounds.x + this.overlay.bounds.width &&
+      bounds.y >= this.overlay.bounds.y - 160 &&
+      bounds.y + bounds.height <= this.overlay.bounds.y + this.overlay.bounds.height && !this.isSolid(bounds);
+  }
+
+  private overlayChunk(chunk: ForestMaterialChunk): ForestMaterialChunk {
+    const bounds = { x: chunk.chunkX * 16, y: chunk.chunkY * 16, width: 16, height: 16 };
+    if (!this.overlay || !overlaps(bounds, this.overlay.bounds) || this.overlay.affectsChunk?.(bounds) === false) return copyChunk(chunk);
+    const materials = chunk.materials.slice();
+    let changed = false;
+    for (let y = 0; y < 16; y++) for (let x = 0; x < 16; x++) {
+      const value = this.overlay.materialAt(bounds.x + x, bounds.y + y);
+      if (value !== null && value !== materials[y * 16 + x]) { materials[y * 16 + x] = value; changed = true; }
+    }
+    if (!changed) return copyChunk(chunk);
+    return Object.freeze({ ...chunk, materials, digest: sha256Canonical([...materials] as JsonValue) });
+  }
+
+  /** Shared by geology and recovery validation, not a separate visual floor. */
+  public openingSurfaceY(x: number): number | null {
+    if (!this.openingSurface || x < 0 || x >= 2496) return null;
+    return this.openingHeights[Math.floor(x)]!;
+  }
+
+  public hasOpeningSurfaceRecovery(bounds: Aabb): boolean {
+    const left = this.openingSurfaceY(bounds.x);
+    const right = this.openingSurfaceY(bounds.x + bounds.width - EPSILON);
+    return left !== null && right !== null && bounds.y >= Math.min(left, right) - 160 &&
+      bounds.y + bounds.height <= Math.max(left, right) + EPSILON && !this.isSolid(bounds);
+  }
+
   private chunkAt(chunkX: number, chunkY: number): ForestMaterialChunk {
+    // Adjacent pixel probes commonly hit one chunk hundreds of times. It is
+    // already most-recently-used; do not churn the LRU map for every pixel.
+    if (this.lastChunk?.chunkX === chunkX && this.lastChunk.chunkY === chunkY) return this.lastChunk;
     const key = `${chunkX},${chunkY}`;
     const cached = this.retained.get(key);
     if (cached) {
       this.retained.delete(key);
       this.retained.set(key, cached);
+      this.lastChunk = cached;
       return cached;
     }
     const materials = new Uint8Array(this.chunkWidth * this.chunkHeight);
@@ -165,6 +276,7 @@ export class ForestChunkStream {
     });
     this.materializedCount += 1;
     this.retained.set(key, chunk);
+    this.lastChunk = chunk;
     while (this.retained.size > this.maxRetainedChunks) {
       this.retained.delete(this.retained.keys().next().value as string);
     }
@@ -177,15 +289,25 @@ export class ForestChunkStream {
     const sealedGate = (context?.sealedGates ?? this.sealedGates).find((bounds) => contains(bounds, x, y));
     if (sealedGate) return FOREST_MATERIAL.protected_mass;
 
-    const inClearance = (context?.clearanceVolumes ?? this.clearanceVolumes)
-      .some((volume) => contains(volume, x, y));
     const protectedMass = (context?.protectedMasses ?? this.protectedMasses)
       .find((zone) => contains(zone.boundsPx, x, y));
+    const surfaceY = this.openingSurfaceY(x);
+    if (surfaceY !== null && !protectedMass && y < surfaceY) return FOREST_MATERIAL.air;
+    const inClearance = (context?.clearanceVolumes ?? this.clearanceVolumes)
+      .some((volume) => contains(volume, x, y));
     if (protectedMass && !inClearance) return protectedMass.kind === "settlement_structure"
       ? FOREST_MATERIAL.wood
       : FOREST_MATERIAL.protected_mass;
 
-    if (this.isWaterPixel(x, y)) return FOREST_MATERIAL.water;
+    if (surfaceY !== null) {
+      // Only remove the old corridor ceiling. Existing free cells, floors and
+      // story anchors remain valid, so previous opening saves do not need a reset.
+      if (y < surfaceY) return FOREST_MATERIAL.air;
+      if(this.overlay?.retireStaticWater && embeddedOpeningRoot(x,y,surfaceY)) return FOREST_MATERIAL.wood;
+      if (y < surfaceY + 9) return FOREST_MATERIAL.soil;
+    }
+
+    if (this.isWaterPixel(x, y) && !(this.openingSurface && this.overlay?.retireStaticWater && x<2496)) return FOREST_MATERIAL.water;
 
     const meadow = this.region.meadowSurfaces.find((surface) =>
       x >= surface.left && x < surface.right);
@@ -233,6 +355,21 @@ export class ForestChunkStream {
       bounds.x + bounds.width <= this.manifest.regionBoundsPx.width &&
       bounds.y + bounds.height <= this.manifest.regionBoundsPx.height;
   }
+}
+
+/** Roots follow authored banks beneath the contact surface, never add floating platforms. */
+function embeddedOpeningRoot(x:number,y:number,surface:number):boolean {
+  const depth=y-surface;
+  if(depth<3 || depth>58) return false;
+  for(const anchor of [1376,1696,2000]) {
+    const dx=x-anchor, reach=Math.abs(dx);
+    if(reach>112) continue;
+    const center=7+reach*0.25+Math.sin(dx/19)*3;
+    const thickness=Math.max(1,5-reach/26);
+    if(Math.abs(depth-center)<thickness) return true;
+    if(reach<72 && Math.abs(depth-(center+reach*0.32+4))<1.5) return true;
+  }
+  return false;
 }
 
 function contains(rect: ForestRectPx, x: number, y: number): boolean {

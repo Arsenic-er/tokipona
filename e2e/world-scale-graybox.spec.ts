@@ -251,7 +251,13 @@ async function traverseToWaterwheel(
       stalledSamples = state.playerX <= lastX + 0.25 ? stalledSamples + 1 : 0;
       lastX = state.playerX;
       if (stalledSamples >= 2) {
-        if (input === "keyboard") await page.keyboard.press("w");
+        if (input === "keyboard") {
+          // The accepted controller has variable-height jumps. A zero-duration
+          // press is only a short hop; hold briefly to clear a real ledge.
+          await page.keyboard.down("w");
+          await page.clock.fastForward(300);
+          await page.keyboard.up("w");
+        }
         else await page.getByRole("button", { name: "跳跃" }).click();
         stalledSamples = 0;
       }

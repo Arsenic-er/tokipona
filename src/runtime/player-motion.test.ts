@@ -22,6 +22,22 @@ function step(
 }
 
 describe("stepPlayerMotion", () => {
+  it("lands at contact rather than leaving the final substep as an air gap", () => {
+    const result = step({ x: 144, y: 64.6, velocityX: 0, velocityY: 150, grounded: false },
+      { moveX: 0, jump: false });
+    expect(result.state.y).toBeCloseTo(66, 3);
+    expect(result.state.y).toBeLessThanOrEqual(66);
+    expect(result.state.grounded).toBe(true);
+    expect(collides({ x: result.state.x, y: result.state.y, ...body })).toBe(false);
+  });
+
+  it("keeps released-jump gravity active on subsequent ascent frames", () => {
+    const state = { x: 144, y: 40, velocityX: 0, velocityY: -100, grounded: false };
+    const release = step(state, { moveX: 0, jump: false }, false);
+    const hold = step(state, { moveX: 0, jump: true }, true);
+    expect(release.state.velocityY - state.velocityY).toBeCloseTo(560 / 60 * 2.4);
+    expect(release.state.velocityY).toBeGreaterThan(hold.state.velocityY);
+  });
   it("reaches walking speed quickly, then builds into a run", () => {
     let state: PlayerMotionState = { x: 144, y: 66, velocityX: 0, velocityY: 0, grounded: true };
     const samples: number[] = [];

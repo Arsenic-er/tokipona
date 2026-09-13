@@ -7,9 +7,9 @@ import {
 import {
   FOREST_OPENING_VIEWPORT,
   projectForestOpeningView,
-  renderForestOpeningView,
   type ForestOpeningPublicView,
 } from "./forest-opening-view";
+import { renderForestOpeningView } from "./forest-opening-renderer";
 import type { LoadedForestOpeningVisualAssets } from "./browser-forest-opening-assets";
 import { projectForestOpeningTravelerPixelRig } from "./forest-opening-candidate-traveler";
 import { rasterizeForestOpeningTerrain } from "./forest-opening-terrain";
@@ -26,6 +26,18 @@ function freshView(): ForestOpeningPublicView {
 }
 
 describe("forest opening public view", () => {
+  it("does not offer glyph observation above its actual interaction radius", () => {
+    const base = PrologueForestOpeningSession.fresh({ sessionId: "view.glyph-range", seed: "glyph-range" }).snapshot();
+    const at = (y: number) => projectForestOpeningView({ ...base,
+      runtime: { ...base.runtime,
+        obstacle: { ...base.runtime.obstacle, committedSolutionId: "shallow_detour" },
+        spatial: { ...base.runtime.spatial, player: { ...base.runtime.spatial.player, position: { x: 2138, y } } },
+      },
+    }, runtimeForestOpeningAssetExport).obstacle.interactionId;
+    // Glyph point y=672; actor bottom y+14. The decorative rectangle starts at 664.
+    expect(at(609)).toBeNull();
+    expect(at(610)).toBe("observe_glyph");
+  });
   it("projects a fixed 640x360 four-depth candidate with tiny non-glowing traveler", () => {
     const view = freshView();
     expect(FOREST_OPENING_VIEWPORT).toEqual({ width: 640, height: 360 });
@@ -59,15 +71,19 @@ describe("forest opening public view", () => {
     });
     session.advanceTicks(120);
     const snapshot = session.snapshot();
-    const view = projectForestOpeningView(snapshot, runtimeForestOpeningAssetExport);
+    const projected = projectForestOpeningView(snapshot, runtimeForestOpeningAssetExport);
+    const view = { ...projected, camera: { ...projected.camera, x: Math.round(projected.camera.x), y: Math.round(projected.camera.y) } };
     const pixels = rasterizeForestOpeningTerrain(session.visibleMaterialChunks(), view.camera);
-    const screenX = Math.floor(snapshot.runtime.spatial.player.position.x + 6 - view.camera.x);
-    const footY = Math.ceil(snapshot.runtime.spatial.player.position.y + 14 - view.camera.y);
+    const left = Math.floor(snapshot.runtime.spatial.player.position.x - view.camera.x);
+    const footY = Math.round(snapshot.runtime.spatial.player.position.y + 14 - view.camera.y);
     const alpha = (x: number, y: number) => pixels[(y * 640 + x) * 4 + 3];
 
     expect(snapshot.runtime.spatial.player.grounded).toBe(true);
-    expect(alpha(screenX, footY - 1)).toBe(0);
-    expect(alpha(screenX, footY)).toBe(255);
+    const sole = Array.from({ length: 12 }, (_, index) => left + index);
+    expect(sole.every((x) => alpha(x, footY - 1) === 0)).toBe(true);
+    // An AABB on a one-pixel uneven surface contacts at its supporting edge,
+    // not necessarily at the center pixel. Rendering must expose that contact.
+    expect(sole.some((x) => alpha(x, footY) === 255)).toBe(true);
   });
 
   it("contains only browser-facing semantic and visual fields", () => {
@@ -168,12 +184,12 @@ describe("forest opening public view", () => {
     }
   });
 
-  it("holds each walk and run pose for five ticks so transition frames remain visible", () => {
+  it("projects locomotion phase supplied by the gait instead of cycling by wall time", () => {
     const base = PrologueForestOpeningSession.fresh({
       sessionId: "view.gait-cadence",
       seed: "view.gait-cadence.seed",
     }).snapshot();
-    const frameAt = (tick: number, velocityX: number) => projectForestOpeningView({
+    const frameAt = (tick: number, velocityX: number, frame = 0) => projectForestOpeningView({
       ...base,
       runtime: {
         ...base.runtime,
@@ -187,15 +203,17 @@ describe("forest opening public view", () => {
           },
         },
       },
-    }, runtimeForestOpeningAssetExport).traveler.frame;
+    }, runtimeForestOpeningAssetExport, null, null, frame).traveler.frame;
 
     expect([frameAt(0, 40), frameAt(4, 40), frameAt(5, 40), frameAt(9, 40)])
-      .toEqual([0, 0, 1, 1]);
+      .toEqual([0, 0, 0, 0]);
     expect([frameAt(0, 88), frameAt(4, 88), frameAt(5, 88), frameAt(9, 88)])
-      .toEqual([0, 0, 1, 1]);
+      .toEqual([0, 0, 0, 0]);
+    expect(frameAt(5, 40, 3)).toBe(3);
+    expect(frameAt(6, 88, 3)).toBe(3);
   });
 
-  it("offers the shallow stream route before loose objects enter interaction range", () => {
+  it("does not offer excavation from the distant bank of the new physical creek", () => {
     const base = PrologueForestOpeningSession.fresh({
       sessionId: "view.shallow-route",
       seed: "view.shallow-route.seed",
@@ -216,11 +234,11 @@ describe("forest opening public view", () => {
     };
 
     const view = projectForestOpeningView(atStreamEdge, runtimeForestOpeningAssetExport);
-    expect(view.obstacle.interactionPrompt).toBe("E · 涉水绕行");
-    expect(view.obstacle.interactionId).toBe("enter_shallow_detour");
+    expect(view.obstacle.interactionPrompt).not.toBe("E · 疏通松土");
+    expect(view.obstacle.interactionId).not.toBe("enter_shallow_detour");
   });
 
-  it("keeps the shallow route readable until a loose object is within half the interaction radius", () => {
+  it("offers the soil tool when the actual plug is the nearest interaction", () => {
     const base = PrologueForestOpeningSession.fresh({
       sessionId: "view.shallow-readable",
       seed: "view.shallow-readable.seed",
@@ -229,11 +247,11 @@ describe("forest opening public view", () => {
       ...base,
       runtime: { ...base.runtime, spatial: { ...base.runtime.spatial, player: {
         ...base.runtime.spatial.player,
-        position: { x: 1_790, y: 690 },
+        position: { x: 1_870, y: 714 },
         grounded: true,
       } } },
     }, runtimeForestOpeningAssetExport);
-    expect(view.obstacle.interactionPrompt).toBe("E · 涉水绕行");
+    expect(view.obstacle.interactionPrompt).toBe("E · 疏通松土");
     expect(view.obstacle.interactionId).toBe("enter_shallow_detour");
   });
 

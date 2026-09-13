@@ -255,7 +255,7 @@ export function projectForestGrayboxView(
   snapshot: ForestGrayboxControllerSnapshot,
   options: Readonly<{ materialPixels?: Uint8ClampedArray }> = {},
 ): ForestGrayboxViewProjection {
-  const camera = snapshot.runtime.camera;
+  const camera = { ...snapshot.runtime.camera, x: Math.round(snapshot.runtime.camera.x), y: Math.round(snapshot.runtime.camera.y) };
   if (camera.width !== FOREST_GRAYBOX_VIEWPORT.width || camera.height !== FOREST_GRAYBOX_VIEWPORT.height) {
     throw new Error("forest graybox view requires the fixed 640×360 camera");
   }
@@ -295,7 +295,7 @@ export function projectForestGrayboxView(
   const landmarkProjection = projectLandmark(camera);
   commands.push(...landmarkProjection.commands);
 
-  const traveler = projectTraveler(snapshot);
+  const traveler = projectTraveler({ ...snapshot, runtime: { ...snapshot.runtime, camera } });
   commands.push(Object.freeze({
     layer: "traveler" as const,
     kind: "traveler" as const,

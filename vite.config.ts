@@ -40,6 +40,7 @@ export function createTokiponaViteConfig(
       },
     }],
     define: {
+      __TOKIPONA_LOCAL_DESKTOP__: "false",
       __TOKIPONA_EXTENSION_LEARNING_ADMITTED__: JSON.stringify(admittedExtensionLearning),
     },
     build: {
@@ -102,7 +103,9 @@ export function createTokiponaViteConfig(
               },
               {
                 name: "app-support",
-                test: /[\\/]src[\\/](?:acceptance|assets|content|runtime)[\\/]/,
+                // Share the tiny lazy-import preload helper with the existing
+                // app-support chunk rather than adding a separate first-load request.
+                test: /(?:[\\/]src[\\/](?:acceptance|assets|content|runtime)[\\/]|vite[\\/]preload-helper)/,
                 priority: 10,
                 minSize: 8 * 1024,
                 entriesAware: true,

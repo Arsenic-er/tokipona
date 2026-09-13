@@ -826,8 +826,7 @@ export class PrologueFlowSession {
   }
 
   core120LearningView(): PrologueFlowCore120LearningView {
-    const state = this.session.snapshot();
-    const runtime = this.snapshot().runtime;
+    const { session: state, runtime } = this.snapshot();
     const point = CORE120_CURRICULUM_MANIFEST.recoveryStation.interactionPointPx;
     const archiveInRange = this.settlement !== null &&
       runtime.sceneId === CORE120_CURRICULUM_MANIFEST.recoveryStation.sceneId &&

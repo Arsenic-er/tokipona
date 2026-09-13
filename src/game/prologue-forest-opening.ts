@@ -34,6 +34,7 @@ const GLYPH_RECEIPT_ID = "forest-opening:glyph:word.telo" as const;
 const FLOW_SYNC_TICK_LIMIT = 1_200;
 const openingManifest = readRuntimeForestOpeningManifest(generatedRuntimeArtifact);
 const spatialManifest = readRuntimeForestSpatialManifest(generatedRuntimeArtifact);
+export const FOREST_OPENING_WORLD_BOUNDS = spatialManifest.regionBoundsPx;
 
 const SOLUTION_ROUTE_FLAG = Object.freeze({
   stone_steps: PROLOGUE_ROUTE_FLAGS.looseStonePushed,
@@ -88,6 +89,7 @@ export interface PrologueForestOpeningActionResult {
 }
 
 export interface PrologueForestOpeningFreshOptions {
+  readonly physics?: 'shared' | 'integrated';
   readonly sessionId: string;
   readonly seed: string;
   readonly currentMp?: number;
@@ -120,7 +122,7 @@ export class PrologueForestOpeningSession {
         currentMp: options.currentMp,
         maxMp: options.maxMp,
       }),
-      ForestOpeningRuntime.fresh({ openingManifest, spatialManifest, seed: options.seed }),
+      ForestOpeningRuntime.fresh({ openingManifest, spatialManifest, seed: options.seed,physics:options.physics }),
     );
   }
 
@@ -136,6 +138,16 @@ export class PrologueForestOpeningSession {
     if (!Number.isSafeInteger(ticks) || ticks < 0) throw new Error("forest opening ticks must be non-negative");
     if (this.snapshot().mode === "settlement_perimeter") return this.snapshot();
     this.runtime.advanceTicks(ticks, input);
+    const solution=this.runtime.snapshot().obstacle.committedSolutionId;
+    if(solution!==null && storyRouteFlags(this.flow.snapshot().session).length===0) {
+      const trial=PrologueFlowSession.fromSave(this.flow.toSave());
+      try {
+        if(!synchronizeToStream(trial) || !commitSemanticSolution(trial,solution)) {
+          this.runtime.rejectPendingCrossing(); return this.snapshot();
+        }
+      } catch(error) { this.runtime.rejectPendingCrossing(); throw error; }
+      this.flow=trial; this.assertConsistent();
+    }
     return this.snapshot();
   }
 
@@ -228,10 +240,11 @@ export class PrologueForestOpeningSession {
   }
 
   public snapshot(): PrologueForestOpeningSnapshot {
-    const session = this.flow.snapshot().session;
+    const flow = this.flow.snapshot();
+    const session = flow.session;
     const runtime = this.runtime.snapshot();
     return Object.freeze({
-      mode: this.flow.snapshot().mode === "settlement" ? "settlement_perimeter" : "forest_opening",
+      mode: flow.mode === "settlement" ? "settlement_perimeter" : "forest_opening",
       session,
       runtime,
       storyRouteReady: storyRouteFlags(session).length === 1,
@@ -240,8 +253,8 @@ export class PrologueForestOpeningSession {
     });
   }
 
-  public visibleMaterialChunks(): readonly ForestMaterialChunk[] {
-    return this.runtime.visibleMaterialChunks();
+  public visibleMaterialChunks(camera?: Aabb): readonly ForestMaterialChunk[] {
+    return this.runtime.visibleMaterialChunks(camera);
   }
 
   public toSave(): PrologueForestOpeningSave {
@@ -296,6 +309,9 @@ export class PrologueForestOpeningSession {
 }
 
 function commitSemanticSolution(flow: PrologueFlowSession, solution: ForestOpeningSolutionId): boolean {
+  // softSoilDug is a historical route-receipt name in the old story runtime.
+  // Actual v0.2 excavation is ONLY creek.excavatedSoil; a physical bypass does
+  // not create grains, tools, inventory, language knowledge or magic.
   const result = solution === "stone_steps"
     ? flow.pushLooseStone(`forest-opening:solution:${solution}`)
     : solution === "deadwood_bridge"
